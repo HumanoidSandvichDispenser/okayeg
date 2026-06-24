@@ -1,0 +1,9 @@
+[package]
+name = "okayeg"
+description = "Local-first real-time conflict-free file/document sync."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+loro.workspace = true

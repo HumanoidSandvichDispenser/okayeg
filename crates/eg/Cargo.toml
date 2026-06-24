@@ -1,0 +1,13 @@
+[package]
+name = "eg"
+description = "Command-line interface for okayeg."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eg"
+path = "src/main.rs"
+
+[dependencies]
+okayeg.workspace = true

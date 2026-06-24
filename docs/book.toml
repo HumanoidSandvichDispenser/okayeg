@@ -1,0 +1,20 @@
+[book]
+title = "okayeg"
+description = "Local-first real-time conflict-free file/document sync."
+authors = ["HumanoidSandvichDispenser"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/HumanoidSandvichDispenser/okayeg"
+edit-url-template = "https://github.com/HumanoidSandvichDispenser/okayeg/edit/main/docs/{path}"
+no-section-label = false
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[preprocessor.mermaid]
