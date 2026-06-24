@@ -35,6 +35,9 @@ pub trait Workspace {
     fn read_file(&self, rel: &Path) -> io::Result<Vec<u8>>;
     /// Write `contents` to the file at `rel`, creating parents as needed.
     fn write_file(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
+    /// Create a new owner-only (0600) file at `rel` with `contents`, for
+    /// secrets like the node key. Fails if it already exists.
+    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
     /// Create the directory at `rel` (and any missing parents).
     fn create_dir(&self, rel: &Path) -> io::Result<()>;
     /// What is at `rel` right now: a file, a directory, or nothing.
@@ -89,6 +92,19 @@ impl Workspace for CapWorkspace {
             }
         }
         self.dir.write(rel, contents)
+    }
+
+    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
+        use cap_std::fs::{OpenOptions, OpenOptionsExt};
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent)?;
+            }
+        }
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let mut file = self.dir.open_with(rel, &opts)?;
+        std::io::Write::write_all(&mut file, contents)
     }
 
     fn create_dir(&self, rel: &Path) -> io::Result<()> {
@@ -184,6 +200,14 @@ impl Workspace for MemWorkspace {
         }
         self.files.borrow_mut().insert(rel.to_path_buf(), contents.to_vec());
         Ok(())
+    }
+
+    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
+        // No real permissions in memory; the disk path is what enforces 0600.
+        if self.files.borrow().contains_key(rel) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, rel.display().to_string()));
+        }
+        self.write_file(rel, contents)
     }
 
     fn create_dir(&self, rel: &Path) -> io::Result<()> {

@@ -4,6 +4,8 @@
 //! folder of text files into a doc and write it back out. All filesystem
 //! access goes through [`Workspace`], which confines it to the workspace root.
 
+mod net;
+mod trust;
 mod watch;
 mod workspace;
 
@@ -14,6 +16,11 @@ use std::process::ExitCode;
 use okayeg::{Doc, NodeKind, TreeID};
 
 use workspace::{CapWorkspace, Entry, Workspace};
+
+/// Where a repo keeps its private state, hidden under the served directory:
+/// the node key now, the doc snapshot and trust set later. Never imported as
+/// doc content.
+const EG_DIR: &str = ".eg";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -28,6 +35,22 @@ fn main() -> ExitCode {
         },
         Some("watch") => match (args.get(2), args.get(3)) {
             (Some(dir), Some(out)) => run(watch::watch(dir.as_ref(), out.as_ref())),
+            _ => usage(),
+        },
+        Some("serve") => match args.get(2) {
+            Some(dir) => run(net::serve(dir.as_ref())),
+            _ => usage(),
+        },
+        Some("pull") => match (args.get(2), args.get(3)) {
+            (Some(dir), Some(peer)) => run(net::pull(dir.as_ref(), peer)),
+            _ => usage(),
+        },
+        Some("id") => match args.get(2) {
+            Some(dir) => run(net::id(dir.as_ref())),
+            _ => usage(),
+        },
+        Some("trust") => match (args.get(2), args.get(3)) {
+            (Some(dir), Some(peer)) => run(net::trust(dir.as_ref(), peer, &args[4..])),
             _ => usage(),
         },
         _ => usage(),
@@ -49,7 +72,11 @@ fn usage() -> ExitCode {
         "usage:\n  \
          eg snapshot <dir> <out.eg>   take a directory into a doc snapshot\n  \
          eg restore  <in.eg> <dir>    write a doc snapshot back to a directory\n  \
-         eg watch    <dir> <out.eg>   keep a doc snapshot in sync with a directory"
+         eg watch    <dir> <out.eg>   keep a doc snapshot in sync with a directory\n  \
+         eg serve    <dir>            serve a directory over iroh for peers to sync\n  \
+         eg pull     <dir> <peer>     sync a directory from a peer's endpoint id\n  \
+         eg id       <dir>            print this repo's endpoint id\n  \
+         eg trust    <dir> <peer> [pull] [push]   grant a peer access (default both)"
     );
     ExitCode::FAILURE
 }
@@ -102,6 +129,11 @@ fn import_dir(
     entries.sort_by(|a, b| name_of(a).cmp(name_of(b)));
 
     for entry in entries {
+        // `.eg/` holds the repo's own state (key, and later the snapshot); it is
+        // metadata about the doc, not content of it, so never walk into it.
+        if rel.as_os_str().is_empty() && name_of(&entry) == EG_DIR {
+            continue;
+        }
         match entry {
             Entry::Dir(name) => {
                 let node = tree.create_dir(parent, &name);

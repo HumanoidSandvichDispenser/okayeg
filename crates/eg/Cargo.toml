@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 okayeg.workspace = true
+okayeg-net.workspace = true
 cap-std = "4"
 notify = "8"
 notify-debouncer-full = "0.7"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

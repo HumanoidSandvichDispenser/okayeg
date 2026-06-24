@@ -1,0 +1,13 @@
+[package]
+name = "okayeg-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+okayeg.workspace = true
+iroh = "1"
+tokio = { version = "1", features = ["rt", "io-util", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
