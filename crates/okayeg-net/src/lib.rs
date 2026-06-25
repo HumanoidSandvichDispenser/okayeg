@@ -64,6 +64,9 @@ pub type Shared = Rc<Doc>;
 /// The okayeg sync protocol, as named on the iroh wire.
 pub const ALPN: &[u8] = b"okayeg/sync/0";
 
+/// Largest frame we will read to not allow a peer to make us allocate more than this much at once.
+const MAX_FRAME: usize = 64 << 20;
+
 /// Something went wrong moving sync bytes.
 #[derive(Debug)]
 pub enum Error {
@@ -180,6 +183,11 @@ async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, Error
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME {
+        return Err(Error::Transport(format!(
+            "frame of {len} bytes exceeds {MAX_FRAME} cap"
+        )));
+    }
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body).await?;
     Ok(body)
@@ -307,6 +315,14 @@ mod tests {
                 converge(|| doc_a.text("body").to_string() == "hello world").await;
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_length() {
+        let header = (MAX_FRAME as u32 + 1).to_be_bytes();
+        let mut src = &header[..];
+        let err = read_frame(&mut src).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
     }
 
     #[tokio::test]
