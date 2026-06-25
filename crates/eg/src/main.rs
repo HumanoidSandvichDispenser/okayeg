@@ -4,6 +4,7 @@
 //! folder of text files into a doc and write it back out. All filesystem
 //! access goes through [`Workspace`], which confines it to the workspace root.
 
+mod ignore;
 mod net;
 mod trust;
 mod watch;
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 
 use okayeg::{Doc, NodeKind, TreeID};
 
+use ignore::Ignorer;
 use workspace::{CapWorkspace, Entry, Workspace};
 
 /// Where a repo keeps its private state, hidden under the served directory:
@@ -111,8 +113,9 @@ fn restore(file: &Path, dir: &Path) -> std::io::Result<()> {
 
 /// Read every file under the workspace into the doc's tree. Returns the file count.
 fn import_tree(ws: &dyn Workspace, doc: &Doc) -> std::io::Result<usize> {
+    let ignorer = Ignorer::load(ws)?;
     let mut files = 0;
-    import_dir(ws, doc, Path::new(""), None, &mut files)?;
+    import_dir(ws, doc, &ignorer, Path::new(""), None, &mut files)?;
     doc.commit();
     Ok(files)
 }
@@ -120,6 +123,7 @@ fn import_tree(ws: &dyn Workspace, doc: &Doc) -> std::io::Result<usize> {
 fn import_dir(
     ws: &dyn Workspace,
     doc: &Doc,
+    ignorer: &Ignorer,
     rel: &Path,
     parent: Option<TreeID>,
     files: &mut usize,
@@ -134,10 +138,15 @@ fn import_dir(
         if rel.as_os_str().is_empty() && name_of(&entry) == EG_DIR {
             continue;
         }
+        let path = rel.join(name_of(&entry));
+        // Checked after `.eg/`, so `.eg/ignore` adds to that skip, never undoes it.
+        if ignorer.should_ignore(&path, matches!(entry, Entry::Dir(_))) {
+            continue;
+        }
         match entry {
             Entry::Dir(name) => {
                 let node = tree.create_dir(parent, &name);
-                import_dir(ws, doc, &rel.join(&name), Some(node), files)?;
+                import_dir(ws, doc, ignorer, &rel.join(&name), Some(node), files)?;
             }
             Entry::File(name) => {
                 let bytes = ws.read_file(&rel.join(&name))?;
@@ -166,13 +175,14 @@ fn import_dir(
 
 /// Write the doc's tree out into the workspace. Returns the file count.
 fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<usize> {
+    let ignorer = Ignorer::load(ws)?;
     let mut files = 0;
     for node in doc.files().roots() {
         // do not materialize any files in .eg
         if doc.files().name(node).as_deref() == Some(EG_DIR) {
             continue;
         }
-        export_node(doc, ws, node, Path::new(""), &mut files)?;
+        export_node(doc, ws, &ignorer, node, Path::new(""), &mut files)?;
     }
     Ok(files)
 }
@@ -180,6 +190,7 @@ fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<usize> {
 fn export_node(
     doc: &Doc,
     ws: &dyn Workspace,
+    ignorer: &Ignorer,
     node: TreeID,
     parent: &Path,
     files: &mut usize,
@@ -189,11 +200,16 @@ fn export_node(
         return Ok(());
     };
     let rel = parent.join(&name);
-    match tree.kind(node) {
+    let kind = tree.kind(node);
+    // Same skip set as import; `.eg/` is already handled by the caller.
+    if ignorer.should_ignore(&rel, matches!(kind, Some(NodeKind::Dir))) {
+        return Ok(());
+    }
+    match kind {
         Some(NodeKind::Dir) => {
             ws.create_dir(&rel)?;
             for child in tree.children(node) {
-                export_node(doc, ws, child, &rel, files)?;
+                export_node(doc, ws, ignorer, child, &rel, files)?;
             }
         }
         Some(NodeKind::File) => {
@@ -278,5 +294,26 @@ mod tests {
             ws.read_file(Path::new(".eg/key")).is_err(),
             ".eg must never be materialized from doc content"
         );
+    }
+
+    #[test]
+    fn ignore_skips_imports_and_prunes_dirs() {
+        let src = MemWorkspace::new();
+        src.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n").unwrap();
+        src.write_file(Path::new("README.md"), b"ok\n").unwrap();
+        src.write_file(Path::new("secrets.env"), b"hunter2\n").unwrap();
+        src.write_file(Path::new("target/build.o"), b"junk\n").unwrap();
+
+        let doc = Doc::new();
+        let imported = import_tree(&src, &doc).unwrap();
+        assert_eq!(imported, 1, "only README.md should be imported");
+
+        // And the ignored paths must not have been materialized on export either.
+        let dst = MemWorkspace::new();
+        dst.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n").unwrap();
+        let exported = export_tree(&doc, &dst).unwrap();
+        assert_eq!(exported, 1);
+        assert_eq!(dst.read_file(Path::new("README.md")).unwrap(), b"ok\n");
+        assert!(dst.read_file(Path::new("secrets.env")).is_err());
     }
 }
