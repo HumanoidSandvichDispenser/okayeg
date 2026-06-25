@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use okayeg::{Doc, NodeKind, TreeID};
+use okayeg::{Doc, NodeKind, Perms, TreeID};
 
 use ignore::Ignorer;
 use workspace::{CapWorkspace, Entry, Workspace};
@@ -56,8 +56,26 @@ enum Cmd {
     Trust {
         peer: String,
         /// Any of `pull` / `push`; empty grants both.
-        flags: Vec<String>,
+        access: Vec<Access>,
     },
+}
+
+/// A capability that can be granted to a peer with `eg trust`.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Access {
+    Pull,
+    Push,
+}
+
+/// Turn the requested access list into a [`Perms`]; empty means full access.
+fn perms_from(access: &[Access]) -> Perms {
+    if access.is_empty() {
+        return Perms::all();
+    }
+    Perms {
+        pull: access.contains(&Access::Pull),
+        push: access.contains(&Access::Push),
+    }
 }
 
 fn main() -> ExitCode {
@@ -71,7 +89,9 @@ fn main() -> ExitCode {
         Cmd::Pull { peer } => with_fresh(dir, |d| net::pull(d, &peer)),
         Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer)),
         Cmd::Id => with_repo(dir, net::id),
-        Cmd::Trust { peer, flags } => with_repo(dir, |d| net::trust(d, &peer, &flags)),
+        Cmd::Trust { peer, access } => {
+            with_repo(dir, |d| net::trust(d, &peer, perms_from(&access)))
+        }
     })
 }
 
@@ -300,6 +320,29 @@ fn to_io<E: std::fmt::Display>(err: E) -> std::io::Error {
 mod tests {
     use super::*;
     use workspace::MemWorkspace;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn perms_from_access_list() {
+        assert_eq!(perms_from(&[]), Perms::all());
+        assert_eq!(
+            perms_from(&[Access::Pull]),
+            Perms { pull: true, push: false }
+        );
+        assert_eq!(
+            perms_from(&[Access::Push]),
+            Perms { pull: false, push: true }
+        );
+        assert_eq!(
+            perms_from(&[Access::Push, Access::Pull, Access::Pull]),
+            Perms { pull: true, push: true }
+        );
+    }
 
     #[test]
     fn round_trips_through_an_in_memory_workspace() {

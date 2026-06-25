@@ -294,37 +294,12 @@ pub fn id(dir: &Path) -> io::Result<()> {
 /// `flags` is any of `pull` / `push`; empty means grant both. Re-running with
 /// `revoked`... is not how revocation works here, that is hand-edited or a later
 /// command; this only adds grants.
-pub fn trust(dir: &Path, peer: &str, flags: &[String]) -> io::Result<()> {
+pub fn trust(dir: &Path, peer: &str, perms: Perms) -> io::Result<()> {
     let ws = open_repo(dir)?;
     let id = EndpointId::from_str(peer).map_err(to_io)?;
-    let perms = perms_from_flags(flags)?;
     trust::add(&ws, id, perms)?;
     println!("eg trust: {id} may {}", trust::flags(perms));
     Ok(())
-}
-
-/// Parse `pull` / `push` flags; no flags means full access.
-fn perms_from_flags(flags: &[String]) -> io::Result<Perms> {
-    if flags.is_empty() {
-        return Ok(Perms::all());
-    }
-    let mut perms = Perms {
-        pull: false,
-        push: false,
-    };
-    for f in flags {
-        match f.as_str() {
-            "pull" => perms.pull = true,
-            "push" => perms.push = true,
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown perm {other:?}; use pull and/or push"),
-                ));
-            }
-        }
-    }
-    Ok(perms)
 }
 
 /// Open `dir` as a confined workspace, creating it (and `.eg/`) if needed.
