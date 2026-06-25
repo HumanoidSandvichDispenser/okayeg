@@ -5,13 +5,19 @@
 //! directory after each peer; `pull` dials a peer once and exits.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
+use std::time::Duration;
 
+use notify::RecursiveMode;
+use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use okayeg::Doc;
-use okayeg_net::{Accepted, EndpointId, Node, Perms};
+use okayeg_net::{drive_live, Accepted, EndpointId, Node, Perms, Shared, Transport};
+use tokio::sync::broadcast;
 
 use crate::trust::{self, Trust};
+use crate::watch::apply_path;
 use crate::workspace::{CapWorkspace, Workspace};
 use crate::{export_tree, import_tree, to_io};
 
@@ -23,15 +29,16 @@ const KEY_PATH: &str = ".eg/key";
 // kept across runs so node ids stay stable; rebuilding from files each run duplicates them on merge
 const DOC_PATH: &str = ".eg/doc";
 
-/// Run an async command on a small current-thread runtime.
+/// Run an async command on a small current-thread runtime, inside a `LocalSet`
+/// so the live runtime can `spawn_local` tasks that hold the `!Send` doc.
 fn block_on<F>(fut: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
 {
-    tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
-        .block_on(fut)
+        .build()?;
+    tokio::task::LocalSet::new().block_on(&rt, fut)
 }
 
 /// This repo's stable secret key, generating and persisting it on first use.
@@ -98,46 +105,67 @@ fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<usize> {
     export_tree(doc, ws)
 }
 
-/// Serve `dir` over iroh, syncing each peer that connects.
-///
-/// Binds an endpoint, prints the id a peer dials, then loops forever: accept a
-/// peer, sync, and rewrite the directory with the merged result.
+/// Serve `dir` over iroh: watch local edits into the doc and sync every peer
+/// that connects, live, until interrupted.
 pub fn serve(dir: &Path) -> std::io::Result<()> {
-    let ws = open_repo(dir)?;
+    let base = dir.canonicalize()?;
+    let ws = Rc::new(open_repo(dir)?);
     block_on(async move {
-        let doc = open_or_seed(&ws)?;
-        let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
-        // Wait until we are online so discovery can route a dial to us.
+        let doc: Shared = Rc::new(open_or_seed(&*ws)?);
+        store(&doc, &*ws)?;
+        let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
         let _ = node.addr().await;
+        let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
         println!("eg serve: listening as {}", node.id());
         println!("  trust a peer: eg trust <dir> <their-id> [pull] [push]");
         loop {
-            // The gate reads trust the moment a peer connects, not before we
-            // block waiting for one, so grants and revocations take effect live.
-            let gate = |who| match Trust::load(&ws) {
+            // Trust is read the moment a peer connects, so grants and
+            // revocations take effect live.
+            let gate = |who| match Trust::load(&*ws) {
                 Ok(trust) => trust.perms(who),
                 Err(e) => {
                     eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
                     None
                 }
             };
-            match node.accept_one(&doc, gate).await.map_err(to_io)? {
-                Accepted::Synced(who, perms) => {
-                    let files = store(&doc, &ws)?;
-                    println!(
-                        "eg serve: synced {who} ({}), wrote {files} file(s)",
-                        trust::flags(perms)
-                    );
+            match node.accept(gate).await.map_err(to_io)? {
+                Accepted::Peer { who, perms, send, recv, guard } => {
+                    println!("eg serve: {who} joined ({})", trust::flags(perms));
+                    let doc = doc.clone();
+                    let changed = changed.clone();
+                    tokio::task::spawn_local(async move {
+                        let _guard = guard; // hold the link open for the session
+                        if let Err(e) = drive_live(doc, send, recv, perms, changed).await {
+                            eprintln!("eg serve: {who} dropped: {e}");
+                        }
+                    });
                 }
-                Accepted::Refused(who) => {
-                    println!("eg serve: refused {who} (not trusted)");
-                }
+                Accepted::Refused(who) => println!("eg serve: refused {who} (not trusted)"),
             }
         }
     })
 }
 
-/// Pull from the peer named by `peer` (an endpoint id), merging into `dir`.
+/// Clone `dir` from `peer` if empty, then hold a live session: local edits and
+/// the peer's stream both ways until the link drops.
+pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
+    let base = dir.canonicalize()?;
+    let ws = Rc::new(open_repo(dir)?);
+    block_on(async move {
+        let id = EndpointId::from_str(peer).map_err(to_io)?;
+        let doc: Shared = Rc::new(open_or_clone(&*ws)?);
+        let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
+        let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
+        println!("eg join: syncing live with {id} (ctrl-c to stop)");
+        let (send, recv, _guard) = node.dial(id).await.map_err(to_io)?;
+        drive_live(doc, send, recv, Perms::all(), changed).await.map_err(to_io)?;
+        println!("eg join: link closed");
+        Ok(())
+    })
+}
+
+/// Pull from the peer named by `peer` (an endpoint id), merging into `dir`. One
+/// shot: clone or catch up, write the files, exit.
 pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
     let ws = open_repo(dir)?;
     block_on(async move {
@@ -152,6 +180,104 @@ pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
         );
         Ok(())
     })
+}
+
+/// Wire the FS watcher and disk exporter onto the shared doc, returning the
+/// repo-wide change nudge. The watcher folds local edits in (firing the nudge
+/// when they move the doc); the exporter writes the doc back out on every nudge,
+/// whatever its source.
+fn spawn_watch_and_export(
+    ws: Rc<CapWorkspace>,
+    base: PathBuf,
+    doc: Shared,
+) -> io::Result<broadcast::Sender<()>> {
+    let (changed, _) = broadcast::channel::<()>(64);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(150),
+        None,
+        move |res: DebounceEventResult| {
+            let _ = tx.send(res);
+        },
+    )
+    .map_err(to_io)?;
+    debouncer
+        .watch(&base, RecursiveMode::Recursive)
+        .map_err(to_io)?;
+
+    // ingest: fold each changed path in, nudge only when the doc actually moves.
+    let in_ws = ws.clone();
+    let in_doc = doc.clone();
+    let in_changed = changed.clone();
+    tokio::task::spawn_local(async move {
+        // hold the watcher alive for as long as we drain it
+        let _debouncer = debouncer;
+        while let Some(res) = rx.recv().await {
+            let events = match res {
+                Ok(events) => events,
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("eg: watch error: {e}");
+                    }
+                    continue;
+                }
+            };
+            let paths = changed_paths(&events, &base);
+            if paths.is_empty() {
+                continue;
+            }
+            let before = in_doc.version();
+            for rel in &paths {
+                if let Err(e) = apply_path(&*in_ws, &in_doc, rel) {
+                    eprintln!("eg: {e}");
+                }
+            }
+            in_doc.commit();
+            if in_doc.version() != before {
+                let _ = in_changed.send(());
+            }
+        }
+    });
+
+    // egress: on any nudge (local or peer), write the doc back to disk.
+    let out_ws = ws;
+    let out_doc = doc;
+    let mut nudged = changed.subscribe();
+    tokio::task::spawn_local(async move {
+        loop {
+            match nudged.recv().await {
+                Err(broadcast::error::RecvError::Closed) => break,
+                _ => {
+                    if let Err(e) = store(&out_doc, &*out_ws) {
+                        eprintln!("eg: export: {e}");
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(changed)
+}
+
+/// Collect the unique repo-relative paths touched by a batch, skipping `.eg/`.
+fn changed_paths(events: &[notify_debouncer_full::DebouncedEvent], base: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for event in events {
+        for path in &event.paths {
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() || rel.starts_with(EG_DIR) {
+                continue;
+            }
+            let rel = rel.to_path_buf();
+            if !paths.contains(&rel) {
+                paths.push(rel);
+            }
+        }
+    }
+    paths
 }
 
 /// Print this repo's endpoint id, the address a peer dials and trusts.

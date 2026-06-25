@@ -7,5 +7,5 @@ mod sync;
 mod tree;
 
 pub use doc::Doc;
-pub use sync::{Msg, Perms, Step, Sync, SyncError};
+pub use sync::{Live, LiveSync, Msg, Perms, Step, Sync, SyncError};
 pub use tree::{FileTree, NodeKind, TreeID};

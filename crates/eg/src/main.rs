@@ -47,6 +47,10 @@ fn main() -> ExitCode {
             (Some(dir), Some(peer)) => run(net::pull(dir.as_ref(), peer)),
             _ => usage(),
         },
+        Some("join") => match (args.get(2), args.get(3)) {
+            (Some(dir), Some(peer)) => run(net::join(dir.as_ref(), peer)),
+            _ => usage(),
+        },
         Some("id") => match args.get(2) {
             Some(dir) => run(net::id(dir.as_ref())),
             _ => usage(),
@@ -75,8 +79,9 @@ fn usage() -> ExitCode {
          eg snapshot <dir> <out.eg>   take a directory into a doc snapshot\n  \
          eg restore  <in.eg> <dir>    write a doc snapshot back to a directory\n  \
          eg watch    <dir> <out.eg>   keep a doc snapshot in sync with a directory\n  \
-         eg serve    <dir>            serve a directory over iroh for peers to sync\n  \
-         eg pull     <dir> <peer>     sync a directory from a peer's endpoint id\n  \
+         eg serve    <dir>            serve a directory over iroh, live, for peers to sync\n  \
+         eg pull     <dir> <peer>     one-shot sync a directory from a peer's endpoint id\n  \
+         eg join     <dir> <peer>     clone if empty, then sync live with a peer\n  \
          eg id       <dir>            print this repo's endpoint id\n  \
          eg trust    <dir> <peer> [pull] [push]   grant a peer access (default both)"
     );

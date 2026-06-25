@@ -6,10 +6,11 @@
 //! peer.
 
 use iroh::endpoint::presets;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
-use crate::{drive, Error, ALPN};
+use crate::{drive, Accepted, Error, Transport, ALPN};
 
 /// Generate a fresh 32-byte secret, the raw form of a node's identity.
 ///
@@ -25,17 +26,6 @@ pub fn generate_secret() -> [u8; 32] {
 /// network.
 pub fn id_from_secret(secret: [u8; 32]) -> EndpointId {
     SecretKey::from_bytes(&secret).public()
-}
-
-/// The outcome of accepting one peer at the gate.
-///
-/// Carries the peer's id either way so the caller can log who connected.
-#[derive(Debug)]
-pub enum Accepted {
-    /// The gate did not trust this peer; no sync ran.
-    Refused(EndpointId),
-    /// The peer was synced with these granted perms.
-    Synced(EndpointId, Perms),
 }
 
 /// A bound iroh endpoint that syncs a doc with peers over [`ALPN`].
@@ -82,7 +72,8 @@ impl Node {
     /// Dial `peer` and run one full sync of `doc` against it.
     ///
     /// The dialer grants the peer full perms; access control is the accepting
-    /// side's job (see [`accept_one`](Self::accept_one)).
+    /// side's job. One-shot: used by `pull` to clone or catch up and exit. Live
+    /// sessions go through [`Transport`] + [`drive_live`](crate::drive_live).
     pub async fn sync_with(&self, peer: impl Into<EndpointAddr>, doc: &Doc) -> Result<(), Error> {
         let conn = self
             .endpoint
@@ -102,15 +93,31 @@ impl Node {
         let _ = conn.closed().await;
         Ok(())
     }
+}
 
-    /// Accept one incoming peer, gating it before any sync runs.
-    ///
-    /// `gate` is handed the peer's authenticated [`EndpointId`] and decides what
-    /// it may do: `Some(perms)` to sync with those perms, or `None` to refuse.
-    /// A refused peer's connection is closed and the doc is never touched. The
-    /// gate is where a trust set (`.eg/trust`) is consulted; this crate stays
-    /// out of where that trust lives.
-    pub async fn accept_one<G>(&self, doc: &Doc, gate: G) -> Result<Accepted, Error>
+/// iroh as a live [`Transport`]: peers are [`EndpointId`]s, connections are QUIC
+/// bi-streams, and the held [`Connection`] is the lifetime guard (dropping it
+/// closes the link).
+impl Transport for Node {
+    type Id = EndpointId;
+    type Send = SendStream;
+    type Recv = RecvStream;
+    type Guard = Connection;
+
+    async fn dial(&self, peer: EndpointId) -> Result<(SendStream, RecvStream, Connection), Error> {
+        let conn = self
+            .endpoint
+            .connect(peer, ALPN)
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        Ok((send, recv, conn))
+    }
+
+    async fn accept<G>(&self, gate: G) -> Result<Accepted<Self>, Error>
     where
         G: FnOnce(EndpointId) -> Option<Perms>,
     {
@@ -125,7 +132,7 @@ impl Node {
         let who = conn.remote_id();
 
         let Some(perms) = gate(who) else {
-            // Untrusted: refuse before opening a stream or touching the doc.
+            // Untrusted: refuse before opening a stream.
             conn.close(1u32.into(), b"not trusted");
             return Ok(Accepted::Refused(who));
         };
@@ -134,8 +141,6 @@ impl Node {
             .accept_bi()
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
-        drive(doc, send, recv, perms).await?;
-        conn.close(0u32.into(), b"done");
-        Ok(Accepted::Synced(who, perms))
+        Ok(Accepted::Peer { who, perms, send, recv, guard: conn })
     }
 }

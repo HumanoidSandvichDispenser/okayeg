@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 okayeg.workspace = true
 iroh = "1"
-tokio = { version = "1", features = ["rt", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "io-util", "macros", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

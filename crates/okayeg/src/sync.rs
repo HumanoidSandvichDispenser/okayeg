@@ -183,6 +183,70 @@ impl<'a> Sync<'a> {
     }
 }
 
+/// A held-open sync session against one peer.
+///
+/// Unlike [`Sync`], which converges once and stops, this never ends: after the
+/// opening catch-up it keeps streaming each new local commit and importing the
+/// peer's. The caller drives I/O and tells it when the doc changed; the session
+/// tracks how far the peer is caught up.
+pub struct LiveSync {
+    perms: Perms,
+    // how far we believe the peer is caught up; what `pending` measures against
+    acked: VersionVector,
+}
+
+/// What [`LiveSync::on`] wants done after a peer message.
+pub struct Live {
+    /// A message to send the peer, if any.
+    pub send: Option<Msg>,
+    /// The import advanced our doc, so other peers should be nudged.
+    pub changed: bool,
+}
+
+impl LiveSync {
+    pub fn new(perms: Perms) -> Self {
+        Self { perms, acked: VersionVector::default() }
+    }
+
+    /// Our opening message: the version we currently hold.
+    pub fn start(&self, doc: &Doc) -> Msg {
+        Msg::Have(doc.version().encode())
+    }
+
+    /// Feed a message received from the peer.
+    pub fn on(&mut self, doc: &Doc, msg: Msg) -> Result<Live, SyncError> {
+        match msg {
+            // Their opening version: catch them up from it.
+            Msg::Have(vv) => {
+                self.acked = VersionVector::decode(&vv)?;
+                Ok(Live { send: self.pending(doc)?, changed: false })
+            }
+            // Their new commits: import if allowed, report whether it moved us.
+            Msg::Updates(bytes) if self.perms.push => {
+                let before = doc.version();
+                doc.import(&bytes)?;
+                Ok(Live { send: None, changed: doc.version() != before })
+            }
+            Msg::Updates(_) => Ok(Live { send: None, changed: false }),
+        }
+    }
+
+    /// Updates the peer lacks since we last sent, advancing our mark. `None`
+    /// when they are current, or when they may not pull from us.
+    pub fn pending(&mut self, doc: &Doc) -> Result<Option<Msg>, SyncError> {
+        if !self.perms.pull {
+            return Ok(None);
+        }
+        let ver = doc.version();
+        if ver == self.acked {
+            return Ok(None);
+        }
+        let updates = doc.updates_since(&self.acked)?;
+        self.acked = ver;
+        Ok(Some(Msg::Updates(updates)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +381,35 @@ mod tests {
         assert!(keeper.text("body").to_string().contains("mine"), "push was accepted");
         // ...but keeper's "secret" never reached reader.
         assert!(!reader.text("body").to_string().contains("secret"), "pull leaked out");
+    }
+
+    #[test]
+    fn live_session_streams_commits_and_breaks_echo() {
+        let a = Doc::new();
+        let b = Doc::from_snapshot(&a.snapshot().unwrap()).unwrap();
+        let mut la = LiveSync::new(Perms::all());
+        let mut lb = LiveSync::new(Perms::all());
+
+        // handshake: each sends Have, each catches the other up.
+        let to_a = lb.on(&b, la.start(&a)).unwrap();
+        let to_b = la.on(&a, lb.start(&b)).unwrap();
+        assert!(to_a.send.is_none() && to_b.send.is_none(), "nothing to catch up yet");
+
+        // a commits mid-session; its pending carries just the delta.
+        a.text("body").insert(0, "hello").unwrap();
+        a.commit();
+        let msg = la.pending(&a).unwrap().expect("delta for b");
+        let landed = lb.on(&b, msg).unwrap();
+        assert!(landed.changed, "b moved");
+        assert_eq!(b.text("body").to_string(), "hello");
+
+        // a has nothing further; the mark caught up.
+        assert!(la.pending(&a).unwrap().is_none());
+
+        // b, nudged by its own import, echoes a's ops back; a re-imports as a
+        // no-op and reports no change, so the ping does not bounce.
+        let echo = lb.pending(&b).unwrap().expect("b re-sends what it just got");
+        assert!(!la.on(&a, echo).unwrap().changed, "echo must not move a");
     }
 
     #[test]
