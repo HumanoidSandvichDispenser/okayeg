@@ -178,6 +178,26 @@ impl FileTree<'_> {
         let value = self.meta(node)?.get(key)?;
         Some(value.as_value()?.as_string()?.to_string())
     }
+
+    /// Walk the subtrees under `roots` depth-first, each node paired with its
+    /// kind. Descends into directories only; files, boundaries, and nodes with
+    /// no metadata are leaves. Pass a filtered `roots` to leave out subtrees
+    /// such as `.eg/`.
+    pub fn walk(
+        &self,
+        roots: impl IntoIterator<Item = TreeID>,
+    ) -> Vec<(TreeID, Option<NodeKind>)> {
+        let mut stack: Vec<TreeID> = roots.into_iter().collect();
+        let mut nodes = Vec::new();
+        while let Some(node) = stack.pop() {
+            let kind = self.kind(node);
+            if kind == Some(NodeKind::Dir) {
+                stack.extend(self.children(node));
+            }
+            nodes.push((node, kind));
+        }
+        nodes
+    }
 }
 
 #[cfg(test)]

@@ -27,13 +27,16 @@ const TRUST_PATH: &str = ".eg/trust";
 
 /// A parsed trust set: who this repo will sync with, and what each may do.
 pub struct Trust {
-    rows: Vec<Row>,
+    rows: Vec<Grant>,
 }
 
-struct Row {
-    id: EndpointId,
-    perms: Perms,
-    revoked: bool,
+/// What one credential is granted: both a parsed `.eg/trust` row and, once
+/// [`grants`](Trust::grants) collapses duplicates, the effective grant per id.
+#[derive(Clone, Copy)]
+pub struct Grant {
+    pub id: EndpointId,
+    pub perms: Perms,
+    pub revoked: bool,
 }
 
 impl Trust {
@@ -52,7 +55,7 @@ impl Trust {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            rows.push(Row::parse(line).map_err(|msg| {
+            rows.push(Grant::parse(line).map_err(|msg| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(".eg/trust line {}: {msg}", i + 1),
@@ -74,9 +77,22 @@ impl Trust {
         }
         Some(row.perms)
     }
+
+    /// The effective grant for each credential, last row winning like
+    /// [`perms`](Self::perms), in the order ids first appear.
+    pub fn grants(&self) -> Vec<Grant> {
+        let mut grants: Vec<Grant> = Vec::new();
+        for &row in &self.rows {
+            match grants.iter_mut().find(|g| g.id == row.id) {
+                Some(existing) => *existing = row,
+                None => grants.push(row),
+            }
+        }
+        grants
+    }
 }
 
-impl Row {
+impl Grant {
     fn parse(line: &str) -> Result<Self, String> {
         let mut tokens = line.split_whitespace();
         let id_tok = tokens.next().ok_or("missing endpoint id")?;

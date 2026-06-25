@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use okayeg::Doc;
+use okayeg::{Doc, NodeKind};
 use okayeg_net::{drive_live, Accepted, EndpointId, Node, Perms, Shared, Transport};
 use tokio::sync::broadcast;
 
@@ -287,6 +287,58 @@ pub fn id(dir: &Path) -> io::Result<()> {
     let ws = open_repo(dir)?;
     println!("{}", okayeg_net::id_from_secret(repo_secret(&ws)?));
     Ok(())
+}
+
+/// Print a read-only summary of this repo: its id, doc contents, and trust set.
+///
+/// While it does not seed anything, it generates the key on first use like [`id`], so a fresh
+/// directory still gets its `.eg/`.
+pub fn status(dir: &Path) -> io::Result<()> {
+    let ws = open_repo(dir)?;
+    // already absolute and canonical: with_repo ran `dir` through abs().
+    println!("eg status: {}", dir.display());
+    println!("  id:    {}", okayeg_net::id_from_secret(repo_secret(&ws)?));
+
+    match read_doc(&ws)? {
+        Some(doc) => {
+            let (files, dirs) = count_tree(&doc);
+            println!("  doc:   {files} file(s), {dirs} dir(s)");
+        }
+        None => println!("  doc:   not yet seeded (run eg serve or eg pull)"),
+    }
+
+    let grants = Trust::load(&ws)?.grants();
+    if grants.is_empty() {
+        println!("  trust: no peers (grant access with eg trust <id>)");
+    } else {
+        println!("  trust: {} peer(s)", grants.len());
+        for g in grants {
+            let flags = trust::flags(g.perms);
+            let flags = if flags.is_empty() { "none" } else { &flags };
+            let note = if g.revoked { " (revoked)" } else { "" };
+            println!("    {}  {flags}{note}", g.id);
+        }
+    }
+    Ok(())
+}
+
+/// Count the files and directories in a doc's tree, skipping the `.eg/` root
+/// like [`export_tree`].
+fn count_tree(doc: &Doc) -> (usize, usize) {
+    let tree = doc.files();
+    let roots = tree
+        .roots()
+        .into_iter()
+        .filter(|node| tree.name(*node).as_deref() != Some(EG_DIR));
+    let (mut files, mut dirs) = (0, 0);
+    for (_, kind) in tree.walk(roots) {
+        match kind {
+            Some(NodeKind::Dir) => dirs += 1,
+            Some(NodeKind::File) => files += 1,
+            _ => {}
+        }
+    }
+    (files, dirs)
 }
 
 /// Grant `peer` access to this repo, writing it into `.eg/trust`.

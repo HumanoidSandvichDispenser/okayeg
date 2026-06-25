@@ -52,6 +52,8 @@ enum Cmd {
     Join { peer: String },
     /// Print this repo's endpoint id.
     Id,
+    /// Show this repo's id, doc contents, and trust set.
+    Status,
     /// Grant a peer access (default both).
     Trust {
         peer: String,
@@ -89,6 +91,7 @@ fn main() -> ExitCode {
         Cmd::Pull { peer } => with_fresh(dir, |d| net::pull(d, &peer)),
         Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer)),
         Cmd::Id => with_repo(dir, net::id),
+        Cmd::Status => with_repo(dir, net::status),
         Cmd::Trust { peer, access } => {
             with_repo(dir, |d| net::trust(d, &peer, perms_from(&access)))
         }
