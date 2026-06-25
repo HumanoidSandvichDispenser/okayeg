@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 okayeg.workspace = true
 okayeg-net.workspace = true
+clap = { version = "4", features = ["derive"] }
 cap-std = "4"
 ignore = "0.4"
 notify = "8"

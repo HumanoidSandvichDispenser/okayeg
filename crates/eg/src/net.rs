@@ -117,7 +117,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         let _ = node.addr().await;
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
         println!("eg serve: listening as {}", node.id());
-        println!("  trust a peer: eg trust <dir> <their-id> [pull] [push]");
+        println!("  trust a peer: eg trust <their-id> [pull] [push]");
         loop {
             // Trust is read the moment a peer connects, so grants and
             // revocations take effect live.
