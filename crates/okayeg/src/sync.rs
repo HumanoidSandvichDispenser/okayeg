@@ -257,6 +257,32 @@ mod tests {
     }
 
     #[test]
+    fn cloned_docs_merge_concurrent_edits_to_one_file() {
+        // clone via snapshot so both share the file's tree id
+        let a = Doc::new();
+        let node = a.files().create_file(None, "note.txt");
+        a.files().content(node).unwrap().insert(0, "hello").unwrap();
+        a.commit();
+        let b = Doc::from_snapshot(&a.snapshot().unwrap()).unwrap();
+
+        a.files().content(node).unwrap().insert(5, " from A").unwrap();
+        a.commit();
+        b.files().content(node).unwrap().insert(0, "[B] ").unwrap();
+        b.commit();
+
+        sync_pair(&a, &b);
+
+        assert_eq!(a.files().roots().len(), 1, "should stay one file, not duplicate");
+        assert_eq!(b.files().roots().len(), 1);
+        let merged = a.files().content(node).unwrap().to_string();
+        assert_eq!(merged, b.files().content(node).unwrap().to_string(), "diverged");
+        assert!(
+            merged.contains("from A") && merged.contains("[B]"),
+            "lost an edit: {merged:?}"
+        );
+    }
+
+    #[test]
     fn a_peer_denied_push_cannot_write_to_us() {
         // `keeper` will grant `writer` pull but not push. writer's change must
         // not land in keeper, while keeper's own state still flows to writer.

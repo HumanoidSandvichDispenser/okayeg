@@ -20,6 +20,9 @@ use crate::EG_DIR;
 /// This node's secret key, the raw form of its identity. Owner-only.
 const KEY_PATH: &str = ".eg/key";
 
+// kept across runs so node ids stay stable; rebuilding from files each run duplicates them on merge
+const DOC_PATH: &str = ".eg/doc";
+
 /// Run an async command on a small current-thread runtime.
 fn block_on<F>(fut: F) -> std::io::Result<()>
 where
@@ -53,15 +56,45 @@ fn repo_secret(ws: &dyn Workspace) -> io::Result<[u8; 32]> {
     }
 }
 
-/// Load the directory behind `ws` into a fresh doc.
-fn load(ws: &dyn Workspace) -> io::Result<Doc> {
-    let doc = Doc::new();
-    import_tree(ws, &doc)?;
-    Ok(doc)
+fn open_or_seed(ws: &dyn Workspace) -> io::Result<Doc> {
+    match read_doc(ws)? {
+        Some(doc) => Ok(doc),
+        None => {
+            let doc = Doc::new();
+            import_tree(ws, &doc)?;
+            Ok(doc)
+        }
+    }
 }
 
-/// Write `doc`'s tree back out through `ws`. Returns the file count.
+fn open_or_clone(ws: &dyn Workspace) -> io::Result<Doc> {
+    match read_doc(ws)? {
+        Some(doc) => Ok(doc),
+        None if is_empty_repo(ws)? => Ok(Doc::new()),
+        None => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "refusing to clone into a non-empty directory; clone into an empty one",
+        )),
+    }
+}
+
+fn read_doc(ws: &dyn Workspace) -> io::Result<Option<Doc>> {
+    match ws.read_file(Path::new(DOC_PATH)) {
+        Ok(bytes) => Ok(Some(Doc::from_snapshot(&bytes).map_err(to_io)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_empty_repo(ws: &dyn Workspace) -> io::Result<bool> {
+    use crate::workspace::Entry;
+    Ok(ws.read_dir(Path::new(""))?.iter().all(|e| match e {
+        Entry::Dir(name) | Entry::File(name) => name == EG_DIR,
+    }))
+}
+
 fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<usize> {
+    ws.write_file(Path::new(DOC_PATH), &doc.snapshot().map_err(to_io)?)?;
     export_tree(doc, ws)
 }
 
@@ -72,7 +105,7 @@ fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<usize> {
 pub fn serve(dir: &Path) -> std::io::Result<()> {
     let ws = open_repo(dir)?;
     block_on(async move {
-        let doc = load(&ws)?;
+        let doc = open_or_seed(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
         // Wait until we are online so discovery can route a dial to us.
         let _ = node.addr().await;
@@ -109,7 +142,7 @@ pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
     let ws = open_repo(dir)?;
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
-        let doc = load(&ws)?;
+        let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
         node.sync_with(id, &doc).await.map_err(to_io)?;
         let files = store(&doc, &ws)?;
