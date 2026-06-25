@@ -168,6 +168,10 @@ fn import_dir(
 fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<usize> {
     let mut files = 0;
     for node in doc.files().roots() {
+        // do not materialize any files in .eg
+        if doc.files().name(node).as_deref() == Some(EG_DIR) {
+            continue;
+        }
         export_node(doc, ws, node, Path::new(""), &mut files)?;
     }
     Ok(files)
@@ -245,5 +249,34 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn export_never_materializes_an_eg_dir() {
+        let doc = Doc::new();
+        let tree = doc.files();
+        let eg = tree.create_dir(None, ".eg");
+        let key = tree.create_file(Some(eg), "key");
+        if let Some(content) = tree.content(key) {
+            content.insert(0, "attacker-key").unwrap();
+        }
+
+        // a normal file that shouldn't be ignored
+        let readme = tree.create_file(None, "README.md");
+        if let Some(content) = tree.content(readme) {
+            content.insert(0, "ok").unwrap();
+        }
+
+        doc.commit();
+
+        let ws = MemWorkspace::new();
+        let files = export_tree(&doc, &ws).unwrap();
+
+        assert_eq!(files, 1, "only README.md should be written, not .eg/key");
+        assert_eq!(ws.read_file(Path::new("README.md")).unwrap(), b"ok");
+        assert!(
+            ws.read_file(Path::new(".eg/key")).is_err(),
+            ".eg must never be materialized from doc content"
+        );
     }
 }
