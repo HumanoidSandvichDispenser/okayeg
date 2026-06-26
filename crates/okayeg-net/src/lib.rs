@@ -19,7 +19,7 @@ pub use okayeg::Perms;
 /// needs, dialing one peer and accepting the next, so the same runtime can run
 /// over an in-memory pipe in tests (see [`MemTransport`]). The protocol itself
 /// is [`drive_live`], already generic over the stream halves.
-#[allow(async_fn_in_trait)] // single-threaded runtime; no Send bound wanted
+#[allow(async_fn_in_trait)]
 pub trait Transport {
     /// How a peer is named and gated.
     type Id: Copy + Eq + std::fmt::Display + 'static;
@@ -57,8 +57,7 @@ pub enum Accepted<T: Transport + ?Sized> {
     },
 }
 
-/// A doc shared between the live drivers, the watcher, and the exporter. Loro
-/// is interior-mutable, so a plain `Rc` is enough.
+/// A doc shared between the live drivers, the watcher, and the exporter.
 pub type Shared = Rc<Doc>;
 
 /// The okayeg sync protocol, as named on the iroh wire.
@@ -132,7 +131,7 @@ where
 pub async fn drive_live<W, R>(
     doc: Shared,
     mut send: W,
-    mut recv: R,
+    recv: R,
     perms: Perms,
     changed: broadcast::Sender<()>,
 ) -> Result<(), Error>
@@ -145,11 +144,21 @@ where
 
     write_frame(&mut send, &live.start(&doc).encode()).await?;
 
+    // this exists so nudge doesn't just drop the in-flight read half way through a frame
+    async fn next_frame<R: AsyncRead + Unpin>(mut recv: R) -> (R, Result<Vec<u8>, Error>) {
+        let frame = read_frame(&mut recv).await;
+        (recv, frame)
+    }
+
+    let read = next_frame(recv);
+    tokio::pin!(read);
+
     loop {
         tokio::select! {
             biased;
-            frame = read_frame(&mut recv) => {
+            (recv, frame) = &mut read => {
                 let out = live.on(&doc, Msg::decode(&frame?)?)?;
+                read.set(next_frame(recv));
                 if let Some(msg) = out.send {
                     write_frame(&mut send, &msg.encode()).await?;
                 }
@@ -351,5 +360,52 @@ mod tests {
         let merged = a.text("body").to_string();
         assert_eq!(merged, b.text("body").to_string());
         assert!(merged.contains('A') && merged.contains('B'), "got {merged:?}");
+    }
+
+    // Regression for the C1 desync: a `changed` nudge that fires while a frame is
+    // only half-read must not discard the partial read. We feed `drive_live` a
+    // frame's length header, fire a nudge before the body arrives, then deliver
+    // the body. If the in-flight read were dropped (the pre-fix behaviour), the
+    // header bytes would be lost and the body would be misframed, so the doc would
+    // never receive the edit.
+    #[tokio::test]
+    async fn nudge_mid_frame_keeps_the_stream_aligned() {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                // A peer edit, encoded as exactly one Updates frame.
+                let a: Shared = Rc::new(Doc::new());
+                let b = Doc::from_snapshot(&a.snapshot().unwrap()).unwrap();
+                b.text("body").insert(0, "hello").unwrap();
+                b.commit();
+                let updates = b.updates_since(&a.version()).unwrap();
+                let frame = Msg::Updates(updates).encode();
+                let header = (frame.len() as u32).to_be_bytes();
+
+                let (mut feed, a_recv) = tokio::io::duplex(64 * 1024);
+                let (changed, _) = broadcast::channel::<()>(64);
+
+                let ad = a.clone();
+                let drive_changed = changed.clone();
+                tokio::task::spawn_local(async move {
+                    let _ =
+                        drive_live(ad, tokio::io::sink(), a_recv, Perms::all(), drive_changed).await;
+                });
+
+                // Deliver only the header, then let drive_live park mid-frame.
+                feed.write_all(&header).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+
+                // The nudge lands while the body is still outstanding.
+                let _ = changed.send(());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+
+                // Body arrives; an aligned reader completes and applies the frame.
+                feed.write_all(&frame).await.unwrap();
+
+                converge(|| a.text("body").to_string() == "hello").await;
+            })
+            .await;
     }
 }
