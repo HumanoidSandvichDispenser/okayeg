@@ -90,6 +90,8 @@ pub enum SyncError {
     Malformed,
     /// A message arrived that does not fit the current step.
     OutOfOrder,
+    /// The peer pushed updates referencing history we do not have.
+    Orphaned,
     /// Loro rejected an encoded version or a set of updates.
     Loro(LoroError),
 }
@@ -99,12 +101,23 @@ impl std::fmt::Display for SyncError {
         match self {
             SyncError::Malformed => write!(f, "malformed sync message"),
             SyncError::OutOfOrder => write!(f, "sync message arrived out of order"),
+            SyncError::Orphaned => write!(f, "peer pushed updates with missing ancestors"),
             SyncError::Loro(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for SyncError {}
+
+/// Import a peer's updates, rejecting any that reference history we lack.
+/// `ImportStatus::pending` is `Some` only when ops were buffered as orphans, so
+/// this both applies the batch and guards the unbounded pending store.
+fn import_no_orphans(doc: &Doc, bytes: &[u8]) -> Result<(), SyncError> {
+    if doc.import(bytes)?.pending.is_some() {
+        return Err(SyncError::Orphaned);
+    }
+    Ok(())
+}
 
 impl From<LoroError> for SyncError {
     fn from(e: LoroError) -> Self {
@@ -173,7 +186,7 @@ impl<'a> Sync<'a> {
             // otherwise drop it. Either way we have converged as far as we will.
             (State::AwaitUpdates, Msg::Updates(bytes)) => {
                 if self.perms.push {
-                    self.doc.import(&bytes)?;
+                    import_no_orphans(self.doc, &bytes)?;
                 }
                 self.state = State::Done;
                 Ok(Step::Done)
@@ -224,7 +237,7 @@ impl LiveSync {
             // Their new commits: import if allowed, report whether it moved us.
             Msg::Updates(bytes) if self.perms.push => {
                 let before = doc.version();
-                doc.import(&bytes)?;
+                import_no_orphans(doc, &bytes)?;
                 Ok(Live { send: None, changed: doc.version() != before })
             }
             Msg::Updates(_) => Ok(Live { send: None, changed: false }),
@@ -410,6 +423,37 @@ mod tests {
         // no-op and reports no change, so the ping does not bounce.
         let echo = lb.pending(&b).unwrap().expect("b re-sends what it just got");
         assert!(!la.on(&a, echo).unwrap().changed, "echo must not move a");
+    }
+
+    fn orphan_updates() -> Vec<u8> {
+        let src = Doc::new();
+        src.text("body").insert(0, "first").unwrap();
+        src.commit();
+        let after_first = src.version();
+        src.text("body").insert(5, "second").unwrap();
+        src.commit();
+        src.updates_since(&after_first).unwrap()
+    }
+
+    #[test]
+    fn live_rejects_orphan_updates_instead_of_buffering() {
+        let doc = Doc::new();
+        let mut live = LiveSync::new(Perms::all());
+        let res = live.on(&doc, Msg::Updates(orphan_updates()));
+        assert!(matches!(res, Err(SyncError::Orphaned)));
+        assert_eq!(doc.text("body").to_string(), "");
+    }
+
+    #[test]
+    fn one_shot_rejects_orphan_updates_instead_of_buffering() {
+        let doc = Doc::new();
+        let mut sync = Sync::new(&doc);
+        // advance to AwaitUpdates by feeding the peer's Have first.
+        let peer = Doc::new();
+        sync.on(Msg::Have(peer.version().encode())).unwrap();
+        let res = sync.on(Msg::Updates(orphan_updates()));
+        assert!(matches!(res, Err(SyncError::Orphaned)));
+        assert_eq!(doc.text("body").to_string(), "");
     }
 
     #[test]
