@@ -38,6 +38,9 @@ pub trait Workspace {
     /// Create a new owner-only (0600) file at `rel` with `contents`, for
     /// secrets like the node key. Fails if it already exists.
     fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
+    /// Write `contents` to `rel` as an owner-only (0600) file, creating or
+    /// overwriting, for repo-private state like the doc and trust set.
+    fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
     /// Create the directory at `rel` (and any missing parents).
     fn create_dir(&self, rel: &Path) -> io::Result<()>;
     /// What is at `rel` right now: a file, a directory, or nothing.
@@ -105,6 +108,22 @@ impl Workspace for CapWorkspace {
         opts.write(true).create_new(true).mode(0o600);
         let mut file = self.dir.open_with(rel, &opts)?;
         std::io::Write::write_all(&mut file, contents)
+    }
+
+    fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
+        use cap_std::fs::{OpenOptions, OpenOptionsExt};
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent)?;
+            }
+        }
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = self.dir.open_with(rel, &opts)?;
+        std::io::Write::write_all(&mut file, contents)?;
+        let perms = cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(0o600));
+        self.dir.set_permissions(rel, perms)
     }
 
     fn create_dir(&self, rel: &Path) -> io::Result<()> {
@@ -203,10 +222,13 @@ impl Workspace for MemWorkspace {
     }
 
     fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
-        // No real permissions in memory; the disk path is what enforces 0600.
         if self.files.borrow().contains_key(rel) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, rel.display().to_string()));
         }
+        self.write_file(rel, contents)
+    }
+
+    fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
         self.write_file(rel, contents)
     }
 

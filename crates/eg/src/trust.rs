@@ -130,7 +130,7 @@ pub fn add(ws: &dyn Workspace, id: EndpointId, perms: Perms) -> io::Result<()> {
         text.push('\n');
     }
     text.push_str(&format!("{id} {}\n", flags(perms)));
-    ws.write_file(Path::new(TRUST_PATH), text.as_bytes())
+    ws.write_private(Path::new(TRUST_PATH), text.as_bytes())
 }
 
 /// The granted directions as space-separated flags, e.g. `pull push`.

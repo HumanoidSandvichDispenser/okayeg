@@ -101,7 +101,7 @@ fn is_empty_repo(ws: &dyn Workspace) -> io::Result<bool> {
 }
 
 fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<usize> {
-    ws.write_file(Path::new(DOC_PATH), &doc.snapshot().map_err(to_io)?)?;
+    ws.write_private(Path::new(DOC_PATH), &doc.snapshot().map_err(to_io)?)?;
     export_tree(doc, ws)
 }
 
