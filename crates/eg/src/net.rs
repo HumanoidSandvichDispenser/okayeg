@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use okayeg::{Doc, NodeKind};
+use okayeg::{Doc, NodeKind, TreeID};
 use okayeg_net::{drive_live, Accepted, EndpointId, Node, Perms, Shared, Transport};
 use tokio::sync::broadcast;
 
@@ -323,22 +323,37 @@ pub fn status(dir: &Path) -> io::Result<()> {
 }
 
 /// Count the files and directories in a doc's tree, skipping the `.eg/` root
-/// like [`export_tree`].
+/// and any unsafe-named node (and its subtree) just like [`export_tree`], so the
+/// reported count matches what export actually materializes.
 fn count_tree(doc: &Doc) -> (usize, usize) {
     let tree = doc.files();
-    let roots = tree
-        .roots()
-        .into_iter()
-        .filter(|node| tree.name(*node).as_deref() != Some(EG_DIR));
     let (mut files, mut dirs) = (0, 0);
-    for (_, kind) in tree.walk(roots) {
-        match kind {
-            Some(NodeKind::Dir) => dirs += 1,
-            Some(NodeKind::File) => files += 1,
-            _ => {}
+    for node in tree.roots() {
+        if tree.name(node).as_deref() == Some(EG_DIR) {
+            continue;
         }
+        count_node(doc, node, &mut files, &mut dirs);
     }
     (files, dirs)
+}
+
+/// Tally one node and its children, pruning unsafe-named subtrees.
+fn count_node(doc: &Doc, node: TreeID, files: &mut usize, dirs: &mut usize) {
+    let tree = doc.files();
+    let Some(name) = tree.name(node) else { return };
+    if !crate::safe_component(&name) {
+        return;
+    }
+    match tree.kind(node) {
+        Some(NodeKind::Dir) => {
+            *dirs += 1;
+            for child in tree.children(node) {
+                count_node(doc, child, files, dirs);
+            }
+        }
+        Some(NodeKind::File) => *files += 1,
+        _ => {}
+    }
 }
 
 /// Grant `peer` access to this repo, writing it into `.eg/trust`.
@@ -360,4 +375,25 @@ fn open_repo(dir: &Path) -> io::Result<CapWorkspace> {
     let ws = CapWorkspace::open(dir)?;
     ws.create_dir(Path::new(EG_DIR))?;
     Ok(ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_tree_skips_unsafe_named_nodes_like_export() {
+        let doc = Doc::new();
+        let tree = doc.files();
+        // A safe dir with a safe child, plus unsafe siblings that export skips.
+        let dir = tree.create_dir(None, "src");
+        tree.create_file(Some(dir), "main.rs");
+        tree.create_file(None, "ok.txt");
+        tree.create_file(None, "../pwned");
+        tree.create_dir(None, "..");
+        doc.commit();
+
+        // 2 files (ok.txt, src/main.rs), 1 dir (src); the unsafe nodes are gone.
+        assert_eq!(count_tree(&doc), (2, 1));
+    }
 }

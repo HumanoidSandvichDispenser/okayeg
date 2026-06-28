@@ -273,6 +273,22 @@ fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<usize> {
     Ok(files)
 }
 
+/// Whether `name` is safe to materialize as a single path component.
+///
+/// A peer can push a tree node with any name, including `..` or one carrying a
+/// separator. Materializing it would have cap-std refuse the write and abort
+/// the whole export (so no legitimate file lands either), and once the node is
+/// persisted in `.eg/doc` that failure recurs on every later serve. Names that
+/// are not exactly one ordinary path component are skipped instead.
+pub(crate) fn safe_component(name: &str) -> bool {
+    use std::path::Component;
+    let mut comps = Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) => c.to_str() == Some(name),
+        _ => false,
+    }
+}
+
 fn export_node(
     doc: &Doc,
     ws: &dyn Workspace,
@@ -285,6 +301,12 @@ fn export_node(
     let Some(name) = tree.name(node) else {
         return Ok(());
     };
+    // A peer-pushed node may carry an unsafe name; skip it (and its subtree)
+    // rather than let cap-std abort the whole export on it.
+    if !safe_component(&name) {
+        eprintln!("eg: skipping tree node with unsafe name {name:?}");
+        return Ok(());
+    }
     let rel = parent.join(&name);
     let kind = tree.kind(node);
     // Same skip set as import; `.eg/` is already handled by the caller.
@@ -374,6 +396,46 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn safe_component_rejects_traversal_and_separators() {
+        assert!(safe_component("ok.txt"));
+        assert!(safe_component(".hidden"));
+        assert!(safe_component("a file with spaces"));
+        for bad in ["", ".", "..", "../pwned", "a/b", "/abs", "nested/"] {
+            assert!(!safe_component(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn export_skips_unsafe_node_names_on_real_disk() {
+        use workspace::CapWorkspace;
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().parent().unwrap().join("pwned");
+        let _ = std::fs::remove_file(&outside);
+        let ws = CapWorkspace::open(root.path()).unwrap();
+
+        let doc = Doc::new();
+        let tree = doc.files();
+        for bad in ["../pwned", "..", "nested/evil"] {
+            let node = tree.create_file(None, bad);
+            if let Some(content) = tree.content(node) {
+                content.insert(0, "x").unwrap();
+            }
+        }
+        let good = tree.create_file(None, "ok.txt");
+        if let Some(content) = tree.content(good) {
+            content.insert(0, "ok").unwrap();
+        }
+        doc.commit();
+
+        // Export completes (no aborting error) and writes only the safe file.
+        let files = export_tree(&doc, &ws).unwrap();
+        assert_eq!(files, 1, "only ok.txt should materialize");
+        assert_eq!(ws.read_file(Path::new("ok.txt")).unwrap(), b"ok");
+        // Nothing escaped the root.
+        assert!(!outside.exists(), "traversal escaped to {}", outside.display());
     }
 
     #[test]
