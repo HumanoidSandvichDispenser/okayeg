@@ -20,7 +20,7 @@ use crate::workspace::{CapWorkspace, Kind, Workspace};
 pub fn watch(dir: &Path, out: &Path) -> std::io::Result<()> {
     let ws = CapWorkspace::open(dir)?;
     let doc = Doc::new();
-    crate::import_tree(&ws, &doc)?;
+    crate::bridge::import_tree(&ws, &doc)?;
     persist(&doc, out)?;
 
     let base = dir.canonicalize()?;

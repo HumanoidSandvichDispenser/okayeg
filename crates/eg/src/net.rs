@@ -19,7 +19,8 @@ use tokio::sync::broadcast;
 use crate::trust::{self, Trust};
 use crate::watch::apply_path;
 use crate::workspace::{CapWorkspace, Workspace};
-use crate::{export_tree, import_tree, to_io};
+use crate::bridge::{export_tree, import_tree, safe_component};
+use crate::to_io;
 
 use crate::EG_DIR;
 
@@ -341,7 +342,7 @@ fn count_tree(doc: &Doc) -> (usize, usize) {
 fn count_node(doc: &Doc, node: TreeID, files: &mut usize, dirs: &mut usize) {
     let tree = doc.files();
     let Some(name) = tree.name(node) else { return };
-    if !crate::safe_component(&name) {
+    if !safe_component(&name) {
         return;
     }
     match tree.kind(node) {
