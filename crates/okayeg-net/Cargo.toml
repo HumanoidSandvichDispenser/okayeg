@@ -10,7 +10,7 @@ testing = []
 [dependencies]
 okayeg.workspace = true
 iroh = "1"
-tokio = { version = "1", features = ["rt", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "io-util", "macros", "sync", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -114,21 +114,28 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
     block_on(async move {
         let doc: Shared = Rc::new(open_or_seed(&*ws)?);
         store(&doc, &*ws)?;
+
         let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
         let _ = node.addr().await;
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
+
         println!("eg serve: listening as {}", node.id());
         println!("  trust a peer: eg trust <their-id> [pull] [push]");
+
         loop {
-            // Trust is read the moment a peer connects, so grants and
-            // revocations take effect live.
-            let gate = |who| match Trust::load(&*ws) {
-                Ok(trust) => trust.perms(who),
-                Err(e) => {
-                    eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
-                    None
+            // accept a peer, and check trust before handing over the doc. If
+            // the peer is not trusted, the link is dropped.
+            let ws = ws.clone();
+            let gate = |who| async move {
+                match Trust::load(&*ws) {
+                    Ok(trust) => trust.perms(who),
+                    Err(e) => {
+                        eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
+                        None
+                    }
                 }
             };
+
             match node.accept(gate).await.map_err(to_io)? {
                 Accepted::Peer { who, perms, send, recv, guard } => {
                     println!("eg serve: {who} joined ({})", trust::flags(perms));

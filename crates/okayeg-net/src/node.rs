@@ -7,6 +7,8 @@
 
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
+use std::future::Future;
+
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
@@ -117,9 +119,10 @@ impl Transport for Node {
         Ok((send, recv, conn))
     }
 
-    async fn accept<G>(&self, gate: G) -> Result<Accepted<Self>, Error>
+    async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
     where
-        G: FnOnce(EndpointId) -> Option<Perms>,
+        G: FnOnce(EndpointId) -> Fut,
+        Fut: Future<Output = Option<Perms>>,
     {
         let incoming = self
             .endpoint
@@ -131,7 +134,7 @@ impl Transport for Node {
             .map_err(|e| Error::Transport(e.to_string()))?;
         let who = conn.remote_id();
 
-        let Some(perms) = gate(who) else {
+        let Some(perms) = gate(who).await else {
             // Untrusted: refuse before opening a stream.
             conn.close(1u32.into(), b"not trusted");
             return Ok(Accepted::Refused(who));

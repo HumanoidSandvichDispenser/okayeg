@@ -1,6 +1,7 @@
 //! The common transport: iroh p2p plus the loop that drives okayeg's sync protocol over a
 //! connection.
 
+use std::future::Future;
 use std::rc::Rc;
 
 use okayeg::{Doc, LiveSync, Msg, Step, Sync, SyncError};
@@ -37,9 +38,13 @@ pub trait Transport {
     ) -> Result<(Self::Send, Self::Recv, Self::Guard), Error>;
 
     /// Accept the next peer, gating it by id before handing back its stream.
-    async fn accept<G>(&self, gate: G) -> Result<Accepted<Self>, Error>
+    ///
+    /// `gate` is the authz hook: it resolves the peer's id to its [`Perms`], or
+    /// `None` to refuse.
+    async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
     where
-        G: FnOnce(Self::Id) -> Option<Perms>;
+        G: FnOnce(Self::Id) -> Fut,
+        Fut: Future<Output = Option<Perms>>;
 }
 
 /// The outcome of [`Transport::accept`].
@@ -243,9 +248,10 @@ mod mem {
             Ok((send, recv, ()))
         }
 
-        async fn accept<G>(&self, gate: G) -> Result<Accepted<Self>, Error>
+        async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
         where
-            G: FnOnce(u64) -> Option<Perms>,
+            G: FnOnce(u64) -> Fut,
+            Fut: Future<Output = Option<Perms>>,
         {
             let (who, stream) = self
                 .inbound
@@ -254,7 +260,7 @@ mod mem {
                 .recv()
                 .await
                 .ok_or_else(|| Error::Transport("peer gone".into()))?;
-            let Some(perms) = gate(who) else {
+            let Some(perms) = gate(who).await else {
                 return Ok(Accepted::Refused(who));
             };
             let (recv, send) = split(stream);
@@ -298,7 +304,7 @@ mod tests {
                 let bc = cb.clone();
                 tokio::task::spawn_local(async move {
                     if let Ok(Accepted::Peer { send, recv, perms, .. }) =
-                        b.accept(|_| Some(Perms::all())).await
+                        b.accept(|_| async { Some(Perms::all()) }).await
                     {
                         let _ = drive_live(bd, send, recv, perms, bc).await;
                     }
