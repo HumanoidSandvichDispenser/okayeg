@@ -13,7 +13,7 @@ use std::time::Duration;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use okayeg::{Doc, NodeKind, TreeID};
-use okayeg_net::{drive_live, Accepted, EndpointId, Node, Perms, Shared, Transport};
+use okayeg_net::{drive_live, from_fn, Accepted, EndpointId, Node, Perms, Shared, Transport};
 use tokio::sync::broadcast;
 
 use crate::trust::{self, Trust};
@@ -126,17 +126,20 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
             // accept a peer, and check trust before handing over the doc. If
             // the peer is not trusted, the link is dropped.
             let ws = ws.clone();
-            let gate = |who| async move {
-                match Trust::load(&*ws) {
-                    Ok(trust) => trust.perms(who),
-                    Err(e) => {
-                        eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
-                        None
+            let gate = from_fn(move |who| {
+                let ws = ws.clone();
+                async move {
+                    match Trust::load(&*ws) {
+                        Ok(trust) => trust.perms(who),
+                        Err(e) => {
+                            eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
+                            None
+                        }
                     }
                 }
-            };
+            });
 
-            match node.accept(gate).await.map_err(to_io)? {
+            match node.accept(&gate).await.map_err(to_io)? {
                 Accepted::Peer { who, perms, send, recv, guard } => {
                     println!("eg serve: {who} joined ({})", trust::flags(perms));
                     let doc = doc.clone();

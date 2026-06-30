@@ -7,12 +7,11 @@
 
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use std::future::Future;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
-use crate::{drive, Accepted, Error, Transport, ALPN};
+use crate::{drive, Accepted, Authorizer, Error, Transport, ALPN};
 
 /// Generate a fresh 32-byte secret, the raw form of a node's identity.
 ///
@@ -119,10 +118,9 @@ impl Transport for Node {
         Ok((send, recv, conn))
     }
 
-    async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
+    async fn accept<A>(&self, authz: &A) -> Result<Accepted<Self>, Error>
     where
-        G: FnOnce(EndpointId) -> Fut,
-        Fut: Future<Output = Option<Perms>>,
+        A: Authorizer<Id = EndpointId>,
     {
         let incoming = self
             .endpoint
@@ -134,7 +132,7 @@ impl Transport for Node {
             .map_err(|e| Error::Transport(e.to_string()))?;
         let who = conn.remote_id();
 
-        let Some(perms) = gate(who).await else {
+        let Some(perms) = authz.authorize(who).await else {
             // Untrusted: refuse before opening a stream.
             conn.close(1u32.into(), b"not trusted");
             return Ok(Accepted::Refused(who));

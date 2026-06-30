@@ -1,15 +1,16 @@
 //! The common transport: iroh p2p plus the loop that drives okayeg's sync protocol over a
 //! connection.
 
-use std::future::Future;
 use std::rc::Rc;
 
 use okayeg::{Doc, LiveSync, Msg, Step, Sync, SyncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 
+mod authz;
 mod node;
 
+pub use authz::{from_fn, Authorizer, CommandAuthorizer, FnAuthorizer};
 pub use iroh::{EndpointAddr, EndpointId};
 pub use node::{generate_secret, id_from_secret, Node};
 pub use okayeg::Perms;
@@ -39,12 +40,12 @@ pub trait Transport {
 
     /// Accept the next peer, gating it by id before handing back its stream.
     ///
-    /// `gate` is the authz hook: it resolves the peer's id to its [`Perms`], or
-    /// `None` to refuse.
-    async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
+    /// `authz` is the authz hook: it resolves the peer's id to its [`Perms`], or
+    /// `None` to refuse. A closure works, or use [`CommandAuthorizer`] to defer
+    /// the decision to an external script.
+    async fn accept<A>(&self, authz: &A) -> Result<Accepted<Self>, Error>
     where
-        G: FnOnce(Self::Id) -> Fut,
-        Fut: Future<Output = Option<Perms>>;
+        A: Authorizer<Id = Self::Id>;
 }
 
 /// The outcome of [`Transport::accept`].
@@ -248,10 +249,9 @@ mod mem {
             Ok((send, recv, ()))
         }
 
-        async fn accept<G, Fut>(&self, gate: G) -> Result<Accepted<Self>, Error>
+        async fn accept<A>(&self, authz: &A) -> Result<Accepted<Self>, Error>
         where
-            G: FnOnce(u64) -> Fut,
-            Fut: Future<Output = Option<Perms>>,
+            A: Authorizer<Id = u64>,
         {
             let (who, stream) = self
                 .inbound
@@ -260,7 +260,7 @@ mod mem {
                 .recv()
                 .await
                 .ok_or_else(|| Error::Transport("peer gone".into()))?;
-            let Some(perms) = gate(who).await else {
+            let Some(perms) = authz.authorize(who).await else {
                 return Ok(Accepted::Refused(who));
             };
             let (recv, send) = split(stream);
@@ -304,7 +304,7 @@ mod tests {
                 let bc = cb.clone();
                 tokio::task::spawn_local(async move {
                     if let Ok(Accepted::Peer { send, recv, perms, .. }) =
-                        b.accept(|_| async { Some(Perms::all()) }).await
+                        b.accept(&from_fn(|_: u64| async { Some(Perms::all()) })).await
                     {
                         let _ = drive_live(bd, send, recv, perms, bc).await;
                     }
