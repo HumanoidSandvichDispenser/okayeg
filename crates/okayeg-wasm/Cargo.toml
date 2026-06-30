@@ -10,4 +10,20 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 okayeg.workspace = true
+okayeg-net = { path = "../okayeg-net", default-features = false }
+loro.workspace = true
 wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+tsify-next = { version = "0.5", default-features = false, features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["Window", "Storage"]

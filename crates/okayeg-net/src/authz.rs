@@ -13,13 +13,9 @@
 //! (a pqc master key, say) instead of the raw transport key. Nothing here assumes
 //! the id is an ed key, so that promotion would not disturb this code.
 
-use std::ffi::OsStr;
-use std::fmt::Display;
 use std::future::Future;
-use std::process::Stdio;
 
 use okayeg::Perms;
-use tokio::process::Command;
 
 /// Resolves a connecting peer to the rights it may exercise.
 ///
@@ -72,6 +68,8 @@ where
 
 /// An [`Authorizer`] that runs an external command to decide each peer.
 ///
+/// Native only: it spawns a subprocess, so it is not built for wasm targets.
+///
 /// On every connection it spawns `program` with `args` followed by the peer id as
 /// a final argument, then reads the verdict from the command's stdout. okayeg
 /// knows nothing about what the command does; the script is free to query
@@ -85,16 +83,18 @@ where
 ///
 /// Empty output, neither word, or a nonzero exit refuses the peer. A failure to
 /// spawn the command also refuses: a broken authorizer denies rather than leaks.
+#[cfg(feature = "native")]
 pub struct CommandAuthorizer<Id> {
     program: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
     _id: std::marker::PhantomData<fn(Id)>,
 }
 
+#[cfg(feature = "native")]
 impl<Id> CommandAuthorizer<Id> {
     /// Authorize each peer by running `program` (with no extra args). The peer id
     /// is appended as the command's only argument.
-    pub fn new(program: impl AsRef<OsStr>) -> Self {
+    pub fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
         Self {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
@@ -103,17 +103,19 @@ impl<Id> CommandAuthorizer<Id> {
     }
 
     /// Pass a fixed leading argument to the command, before the peer id. Chainable.
-    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+    pub fn arg(mut self, arg: impl AsRef<std::ffi::OsStr>) -> Self {
         self.args.push(arg.as_ref().to_owned());
         self
     }
 }
 
-impl<Id: Display> Authorizer for CommandAuthorizer<Id> {
+#[cfg(feature = "native")]
+impl<Id: std::fmt::Display> Authorizer for CommandAuthorizer<Id> {
     type Id = Id;
 
     async fn authorize(&self, who: Id) -> Option<Perms> {
-        let output = Command::new(&self.program)
+        use std::process::Stdio;
+        let output = tokio::process::Command::new(&self.program)
             .args(&self.args)
             .arg(who.to_string())
             .stdin(Stdio::null())
@@ -132,6 +134,7 @@ impl<Id: Display> Authorizer for CommandAuthorizer<Id> {
 
 /// Read a verdict from the command's stdout. `None` (refuse) unless at least one
 /// of `pull`/`push` is granted.
+#[cfg(feature = "native")]
 fn parse_verdict(stdout: &str) -> Option<Perms> {
     let mut perms = Perms { pull: false, push: false };
     for word in stdout.split_whitespace() {
@@ -144,7 +147,7 @@ fn parse_verdict(stdout: &str) -> Option<Perms> {
     (perms.pull || perms.push).then_some(perms)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
 

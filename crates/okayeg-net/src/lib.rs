@@ -8,10 +8,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 
 mod authz;
+#[cfg(feature = "native")]
 mod node;
 
-pub use authz::{from_fn, Authorizer, CommandAuthorizer, FnAuthorizer};
+pub use authz::{from_fn, Authorizer, FnAuthorizer};
+#[cfg(feature = "native")]
+pub use authz::CommandAuthorizer;
+#[cfg(feature = "native")]
 pub use iroh::{EndpointAddr, EndpointId};
+#[cfg(feature = "native")]
 pub use node::{generate_secret, id_from_secret, Node};
 pub use okayeg::Perms;
 
