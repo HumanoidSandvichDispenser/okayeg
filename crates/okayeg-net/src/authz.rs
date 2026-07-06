@@ -4,7 +4,7 @@
 //! [`Authorizer`] to resolve the peer's id to its [`Perms`], or to refuse it. The
 //! trait is the pluggable hook: a closure works for in-process policy, and
 //! [`CommandAuthorizer`] shells out to a script so the real decision can live
-//! anywhere (a fossenCD api call, a direct db query, an ldap lookup).
+//! anywhere (a web api call, a direct db query, an ldap lookup).
 //!
 //! The id handed to the authorizer is whatever the transport names a peer by. For
 //! the iroh transport that is the peer's ed25519 public key, which iroh has
@@ -70,10 +70,11 @@ where
 ///
 /// Native only: it spawns a subprocess, so it is not built for wasm targets.
 ///
-/// On every connection it spawns `program` with `args` followed by the peer id as
-/// a final argument, then reads the verdict from the command's stdout. okayeg
-/// knows nothing about what the command does; the script is free to query
-/// fossenCD's api, hit its database directly, or anything else.
+/// On every connection it spawns `program` with `args`, writes the peer id (plus
+/// a trailing newline) to the command's stdin, then reads the verdict from its
+/// stdout. okayeg knows nothing about what the command does; the script is free
+/// to call the embedding application's api, hit a database directly, or anything
+/// else.
 ///
 /// The verdict is the whitespace-separated words on stdout:
 ///
@@ -93,7 +94,7 @@ pub struct CommandAuthorizer<Id> {
 #[cfg(feature = "native")]
 impl<Id> CommandAuthorizer<Id> {
     /// Authorize each peer by running `program` (with no extra args). The peer id
-    /// is appended as the command's only argument.
+    /// is written to the command's stdin, newline-terminated.
     pub fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
         Self {
             program: program.as_ref().to_owned(),
@@ -102,7 +103,7 @@ impl<Id> CommandAuthorizer<Id> {
         }
     }
 
-    /// Pass a fixed leading argument to the command, before the peer id. Chainable.
+    /// Pass a fixed argument to the command. Chainable.
     pub fn arg(mut self, arg: impl AsRef<std::ffi::OsStr>) -> Self {
         self.args.push(arg.as_ref().to_owned());
         self
@@ -115,15 +116,23 @@ impl<Id: std::fmt::Display> Authorizer for CommandAuthorizer<Id> {
 
     async fn authorize(&self, who: Id) -> Option<Perms> {
         use std::process::Stdio;
-        let output = tokio::process::Command::new(&self.program)
+        use tokio::io::AsyncWriteExt;
+        let mut child = tokio::process::Command::new(&self.program)
             .args(&self.args)
-            .arg(who.to_string())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
-            .await
+            .spawn()
             .ok()?;
+
+        // A command that decides without reading stdin (say, a blanket grant) may
+        // exit before we write; the resulting EPIPE is not a refusal, so the write
+        // error is ignored and the exit status alone decides.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(format!("{who}\n").as_bytes()).await;
+            // dropping stdin closes it, so a `read`-ing script sees EOF
+        }
+        let output = child.wait_with_output().await.ok()?;
 
         if !output.status.success() {
             return None;
@@ -174,14 +183,20 @@ mod tests {
 
     #[tokio::test]
     async fn command_can_branch_on_the_peer_id() {
-        // sh -c assigns the first arg after the script to $0, so the placeholder
-        // "authz" is $0 and the appended peer id is $1, as a real script sees it.
+        // The id arrives newline-terminated on stdin, as a real script reads it.
         let authz = CommandAuthorizer::<u64>::new("sh")
             .arg("-c")
-            .arg(r#"[ "$1" = "42" ] && echo pull"#)
-            .arg("authz");
+            .arg(r#"read id; [ "$id" = "42" ] && echo pull"#);
         assert_eq!(authz.authorize(42).await, Some(Perms { pull: true, push: false }));
         assert_eq!(authz.authorize(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn command_that_ignores_stdin_still_decides() {
+        // `false` exits without reading; the EPIPE on our stdin write must not
+        // mask the exit status, and a fast blanket grant must still land.
+        let authz = CommandAuthorizer::<u64>::new("sh").arg("-c").arg("exec echo pull");
+        assert_eq!(authz.authorize(7).await, Some(Perms { pull: true, push: false }));
     }
 
     #[tokio::test]

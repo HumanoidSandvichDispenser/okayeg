@@ -5,6 +5,7 @@
 //! [`net`] syncs over iroh, and [`watch`] tracks live edits.
 
 mod bridge;
+mod config;
 mod ignore;
 mod net;
 mod trust;

@@ -3,7 +3,7 @@
 //! okayeg authorizes peers by their ed public key, so each browser needs a
 //! stable secret of its own. We keep the 32-byte seed in localStorage and derive
 //! the iroh `SecretKey` (and thus the `EndpointId` a host trusts) from it. A host
-//! later authorizes this `EndpointId` via fossenCD (see okayeg-net's `Authorizer`).
+//! later authorizes this `EndpointId` (see okayeg-net's `Authorizer`).
 
 use iroh::SecretKey;
 

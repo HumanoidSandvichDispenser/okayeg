@@ -13,9 +13,13 @@ use std::time::Duration;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use okayeg::{Doc, NodeKind, TreeID};
-use okayeg_net::{drive_live, from_fn, Accepted, EndpointId, Node, Perms, Shared, Transport};
+use okayeg_net::{
+    drive_live, Accepted, Authorizer, CommandAuthorizer, EndpointId, Node, Perms, Shared,
+    Transport,
+};
 use tokio::sync::broadcast;
 
+use crate::config::Config;
 use crate::trust::{self, Trust};
 use crate::watch::apply_path;
 use crate::workspace::{CapWorkspace, Workspace};
@@ -120,25 +124,27 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
 
         println!("eg serve: listening as {}", node.id());
-        println!("  trust a peer: eg trust <their-id> [pull] [push]");
+
+        // The gate deciding each incoming connection: the authz command from
+        // .eg/config.toml when one is configured, the trust file otherwise. The
+        // config is read once here at startup; a policy change reaches a running
+        // session only by closing it (the verdict lives with the connection).
+        let gate = match Config::load(&*ws)?.authz_command {
+            Some(cmd) => {
+                println!("  authz: {}", cmd.join(" "));
+                let mut authz = CommandAuthorizer::new(&cmd[0]);
+                for arg in &cmd[1..] {
+                    authz = authz.arg(arg);
+                }
+                Gate::Command(authz)
+            }
+            None => {
+                println!("  trust a peer: eg trust <their-id> [pull] [push]");
+                Gate::Trust(ws.clone())
+            }
+        };
 
         loop {
-            // accept a peer, and check trust before handing over the doc. If
-            // the peer is not trusted, the link is dropped.
-            let ws = ws.clone();
-            let gate = from_fn(move |who| {
-                let ws = ws.clone();
-                async move {
-                    match Trust::load(&*ws) {
-                        Ok(trust) => trust.perms(who),
-                        Err(e) => {
-                            eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
-                            None
-                        }
-                    }
-                }
-            });
-
             match node.accept(&gate).await.map_err(to_io)? {
                 Accepted::Peer { who, perms, send, recv, guard } => {
                     println!("eg serve: {who} joined ({})", trust::flags(perms));
@@ -151,10 +157,38 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                         }
                     });
                 }
-                Accepted::Refused(who) => println!("eg serve: refused {who} (not trusted)"),
+                Accepted::Refused(who) => println!("eg serve: refused {who}"),
             }
         }
     })
+}
+
+/// The connection gate `serve` hands to [`Node::accept`]: either the trust file,
+/// reloaded per connection so a hand edit takes effect without a restart, or the
+/// authz command named in `.eg/config.toml`.
+///
+/// An enum rather than a boxed trait object because [`Authorizer`] has an async
+/// method and is not dyn-safe.
+enum Gate {
+    Trust(Rc<CapWorkspace>),
+    Command(CommandAuthorizer<EndpointId>),
+}
+
+impl Authorizer for Gate {
+    type Id = EndpointId;
+
+    async fn authorize(&self, who: EndpointId) -> Option<Perms> {
+        match self {
+            Gate::Trust(ws) => match Trust::load(&**ws) {
+                Ok(trust) => trust.perms(who),
+                Err(e) => {
+                    eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
+                    None
+                }
+            },
+            Gate::Command(authz) => authz.authorize(who).await,
+        }
+    }
 }
 
 /// Clone `dir` from `peer` if empty, then hold a live session: local edits and
