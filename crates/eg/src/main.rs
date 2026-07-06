@@ -48,6 +48,15 @@ enum Cmd {
     Pull { peer: String },
     /// Clone if empty, then sync live with a peer.
     Join { peer: String },
+    #[command(flatten)]
+    Shared(SharedCmd),
+}
+
+/// Subcommands available both from the shell and inside the `eg serve` repl.
+/// One clap definition, so both surfaces share names, args, and help text; the
+/// repl parses each input line with the same derive (see `net::spawn_repl`).
+#[derive(clap::Subcommand)]
+enum SharedCmd {
     /// Print this repo's endpoint id.
     Id,
     /// Show this repo's id, doc contents, and trust set.
@@ -58,6 +67,17 @@ enum Cmd {
         /// Any of `pull` / `push`; empty grants both.
         access: Vec<Access>,
     },
+}
+
+impl SharedCmd {
+    /// Run against the repo at `dir`, already resolved.
+    fn run(self, dir: &Path) -> std::io::Result<()> {
+        match self {
+            SharedCmd::Id => net::id(dir),
+            SharedCmd::Status => net::status(dir),
+            SharedCmd::Trust { peer, access } => net::trust(dir, &peer, perms_from(&access)),
+        }
+    }
 }
 
 /// A capability that can be granted to a peer with `eg trust`.
@@ -88,11 +108,7 @@ fn main() -> ExitCode {
         Cmd::Serve => with_repo(dir, net::serve),
         Cmd::Pull { peer } => with_fresh(dir, |d| net::pull(d, &peer)),
         Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer)),
-        Cmd::Id => with_repo(dir, net::id),
-        Cmd::Status => with_repo(dir, net::status),
-        Cmd::Trust { peer, access } => {
-            with_repo(dir, |d| net::trust(d, &peer, perms_from(&access)))
-        }
+        Cmd::Shared(cmd) => with_repo(dir, |d| cmd.run(d)),
     })
 }
 

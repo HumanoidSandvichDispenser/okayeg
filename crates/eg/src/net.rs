@@ -122,7 +122,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
         let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
         let _ = node.addr().await;
-        let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
+        let changed = spawn_watch_and_export(ws.clone(), base.clone(), doc.clone())?;
 
         println!("eg serve: listening as {}", node.id());
 
@@ -146,7 +146,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         };
 
         let sessions: Sessions = Rc::new(RefCell::new(Vec::new()));
-        spawn_repl(sessions.clone());
+        spawn_repl(sessions.clone(), base);
 
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
@@ -183,56 +183,78 @@ struct Session {
 /// repl (which lists and revokes). Finished entries are pruned on access.
 type Sessions = Rc<RefCell<Vec<Session>>>;
 
+/// What the serve repl accepts on each stdin line: the repl-only session
+/// commands plus every [`SharedCmd`](crate::SharedCmd), parsed by the same clap
+/// derive as the shell, so names, args, and help text exist once. `multicall`
+/// makes the first word the command (no leading binary name on the line).
+#[derive(clap::Parser)]
+#[command(
+    multicall = true,
+    disable_help_flag = true,
+    about = "Control this running host: one command per line."
+)]
+enum ReplCmd {
+    /// List live sessions and their perms.
+    Sessions,
+    /// Close every live session for a peer.
+    ///
+    /// Only tears down what is running; whether the peer gets back in is the
+    /// gate's call on its next connection, so a lasting revocation also edits
+    /// the trust file or the policy behind the authz command.
+    Revoke { id: EndpointId },
+    #[command(flatten)]
+    Shared(crate::SharedCmd),
+}
+
 /// The serve repl: a line protocol on stdin, for a human at the terminal and for
-/// a supervising parent process alike.
+/// a supervising parent process alike. `help` lists the commands.
 ///
-/// ```text
-/// sessions            list live sessions and their perms
-/// revoke <id>         close every live session for that peer
-/// ```
-///
-/// Revoking here only tears down what is running; whether the peer gets back in
-/// is the gate's call on its next connection, so a lasting revocation also edits
-/// the trust file or the policy behind the authz command. EOF on stdin ends the
-/// repl and serving continues, so `eg serve < /dev/null` still works headless.
-fn spawn_repl(sessions: Sessions) {
+/// EOF on stdin ends the repl and serving continues, so `eg serve < /dev/null`
+/// still works headless.
+fn spawn_repl(sessions: Sessions, dir: PathBuf) {
     tokio::task::spawn_local(async move {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let mut words = line.split_whitespace();
-            match words.next() {
-                None => {}
-                Some("sessions") => {
-                    let mut sessions = sessions.borrow_mut();
-                    sessions.retain(|s| !s.handle.is_finished());
-                    println!("eg serve: {} session(s)", sessions.len());
-                    for s in sessions.iter() {
-                        println!("  {} {}", s.who, trust::flags(s.perms));
-                    }
-                }
-                Some("revoke") => match words.next().map(EndpointId::from_str) {
-                    Some(Ok(id)) => {
-                        let mut sessions = sessions.borrow_mut();
-                        let mut dropped = 0;
-                        sessions.retain(|s| {
-                            if s.who == id && !s.handle.is_finished() {
-                                s.handle.abort();
-                                dropped += 1;
-                            }
-                            s.who != id
-                        });
-                        println!("eg serve: revoked {id} ({dropped} session(s) closed)");
-                    }
-                    Some(Err(e)) => println!("eg serve: revoke: bad id: {e}"),
-                    None => println!("eg serve: revoke: usage: revoke <endpoint-id>"),
-                },
-                Some(other) => {
-                    println!("eg serve: unknown command {other:?} (commands: sessions, revoke <id>)")
-                }
+            if line.trim().is_empty() {
+                continue;
+            }
+            match <ReplCmd as clap::Parser>::try_parse_from(line.split_whitespace()) {
+                Ok(cmd) => run_repl_cmd(cmd, &sessions, &dir),
+                Err(e) => print!("{e}"), // clap's own usage/help text
             }
         }
     });
+}
+
+fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path) {
+    match cmd {
+        ReplCmd::Sessions => {
+            let mut sessions = sessions.borrow_mut();
+            sessions.retain(|s| !s.handle.is_finished());
+            println!("eg serve: {} session(s)", sessions.len());
+            for s in sessions.iter() {
+                println!("  {} {}", s.who, trust::flags(s.perms));
+            }
+        }
+        ReplCmd::Revoke { id } => {
+            let mut sessions = sessions.borrow_mut();
+            let mut dropped = 0;
+            sessions.retain(|s| {
+                if s.who == id && !s.handle.is_finished() {
+                    s.handle.abort();
+                    dropped += 1;
+                }
+                s.who != id
+            });
+            println!("eg serve: revoked {id} ({dropped} session(s) closed)");
+        }
+        ReplCmd::Shared(cmd) => {
+            if let Err(e) = cmd.run(dir) {
+                println!("eg serve: {e}");
+            }
+        }
+    }
 }
 
 /// The connection gate `serve` hands to [`Node::accept`]: either the trust file,
