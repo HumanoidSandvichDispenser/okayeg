@@ -4,6 +4,7 @@
 //! the merged result back out. `serve` keeps listening and rewrites the
 //! directory after each peer; `pull` dials a peer once and exits.
 
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -144,23 +145,94 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
             }
         };
 
+        let sessions: Sessions = Rc::new(RefCell::new(Vec::new()));
+        spawn_repl(sessions.clone());
+
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
                 Accepted::Peer { who, perms, send, recv, guard } => {
                     println!("eg serve: {who} joined ({})", trust::flags(perms));
                     let doc = doc.clone();
                     let changed = changed.clone();
-                    tokio::task::spawn_local(async move {
+                    let handle = tokio::task::spawn_local(async move {
                         let _guard = guard; // hold the link open for the session
                         if let Err(e) = drive_live(doc, send, recv, perms, changed).await {
                             eprintln!("eg serve: {who} dropped: {e}");
                         }
                     });
+                    let mut sessions = sessions.borrow_mut();
+                    sessions.retain(|s| !s.handle.is_finished());
+                    sessions.push(Session { who, perms, handle });
                 }
                 Accepted::Refused(who) => println!("eg serve: refused {who}"),
             }
         }
     })
+}
+
+/// One live peer session: the capability minted at accept, held so the serving
+/// side can tear it down. Aborting `handle` drops the session's link guard, which
+/// closes the connection; the capability and the connection end together.
+struct Session {
+    who: EndpointId,
+    perms: Perms,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// The live sessions, shared between the accept loop (which registers) and the
+/// repl (which lists and revokes). Finished entries are pruned on access.
+type Sessions = Rc<RefCell<Vec<Session>>>;
+
+/// The serve repl: a line protocol on stdin, for a human at the terminal and for
+/// a supervising parent process alike.
+///
+/// ```text
+/// sessions            list live sessions and their perms
+/// revoke <id>         close every live session for that peer
+/// ```
+///
+/// Revoking here only tears down what is running; whether the peer gets back in
+/// is the gate's call on its next connection, so a lasting revocation also edits
+/// the trust file or the policy behind the authz command. EOF on stdin ends the
+/// repl and serving continues, so `eg serve < /dev/null` still works headless.
+fn spawn_repl(sessions: Sessions) {
+    tokio::task::spawn_local(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let mut words = line.split_whitespace();
+            match words.next() {
+                None => {}
+                Some("sessions") => {
+                    let mut sessions = sessions.borrow_mut();
+                    sessions.retain(|s| !s.handle.is_finished());
+                    println!("eg serve: {} session(s)", sessions.len());
+                    for s in sessions.iter() {
+                        println!("  {} {}", s.who, trust::flags(s.perms));
+                    }
+                }
+                Some("revoke") => match words.next().map(EndpointId::from_str) {
+                    Some(Ok(id)) => {
+                        let mut sessions = sessions.borrow_mut();
+                        let mut dropped = 0;
+                        sessions.retain(|s| {
+                            if s.who == id && !s.handle.is_finished() {
+                                s.handle.abort();
+                                dropped += 1;
+                            }
+                            s.who != id
+                        });
+                        println!("eg serve: revoked {id} ({dropped} session(s) closed)");
+                    }
+                    Some(Err(e)) => println!("eg serve: revoke: bad id: {e}"),
+                    None => println!("eg serve: revoke: usage: revoke <endpoint-id>"),
+                },
+                Some(other) => {
+                    println!("eg serve: unknown command {other:?} (commands: sessions, revoke <id>)")
+                }
+            }
+        }
+    });
 }
 
 /// The connection gate `serve` hands to [`Node::accept`]: either the trust file,
