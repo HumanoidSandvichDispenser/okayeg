@@ -5,6 +5,8 @@ use loro::{
 /// A single Okayeg doc, wrapping one Loro document.
 pub struct Doc {
     inner: LoroDoc,
+    /// Session-scoped sequence used to mint comment ids.
+    pub(crate) comment_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Doc {
@@ -12,6 +14,7 @@ impl Doc {
     pub fn new() -> Self {
         Self {
             inner: LoroDoc::new(),
+            comment_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -19,7 +22,10 @@ impl Doc {
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, LoroError> {
         let inner = LoroDoc::new();
         inner.import(bytes)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            comment_seq: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// The text container with the given name, created on first access.

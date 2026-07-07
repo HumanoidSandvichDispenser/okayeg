@@ -15,6 +15,8 @@ pub fn version() -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
+mod comments;
+#[cfg(target_arch = "wasm32")]
 mod identity;
 #[cfg(target_arch = "wasm32")]
 mod wire;
@@ -42,6 +44,7 @@ mod client {
         on_log: RefCell<Option<Function>>,
         on_files: RefCell<Option<Function>>,
         on_file_content: RefCell<Option<Function>>,
+        on_comments: RefCell<Option<Function>>,
         on_disconnect: RefCell<Option<Function>>,
     }
 
@@ -66,6 +69,12 @@ mod client {
                     &JsValue::from_str(path),
                     &JsValue::from_str(content),
                 );
+            }
+        }
+
+        fn comments(&self, comments: &Array) {
+            if let Some(f) = self.on_comments.borrow().as_ref() {
+                let _ = f.call1(&JsValue::NULL, comments);
             }
         }
 
@@ -155,7 +164,7 @@ mod client {
         pub fn files(&self) -> Array {
             collect_files(&self.doc)
                 .into_iter()
-                .map(|(path, _)| JsValue::from_str(&path))
+                .map(|(path, _, _)| JsValue::from_str(&path))
                 .collect()
         }
 
@@ -215,6 +224,74 @@ mod client {
             }
         }
 
+        /// All comments in the project. Each is `{id, file, parent, createdAt,
+        /// range, orphaned, fields}`; see the [`comments`](crate::comments)
+        /// module for the shape.
+        pub fn comments(&self) -> Array {
+            let nodes: Vec<(String, TreeID)> = collect_files(&self.doc)
+                .into_iter()
+                .map(|(p, n, _)| (p, n))
+                .collect();
+            crate::comments::to_js(&self.doc, &nodes)
+        }
+
+        /// Anchor a comment to `[start, end)` (Unicode code points) in a file,
+        /// with consumer fields such as `body` and `author`, then push.
+        /// Returns the comment id, or `null` when the file or range is bad.
+        #[wasm_bindgen(js_name = addComment)]
+        pub fn add_comment(
+            &self,
+            path: String,
+            start: usize,
+            end: usize,
+            fields: JsValue,
+        ) -> Option<String> {
+            let node = find_file(&self.doc, &path)?;
+            let id = self.doc.comments().add(
+                node,
+                start..end,
+                js_sys::Date::now() as i64,
+                &crate::comments::fields_from_js(&fields),
+            )?;
+            self.commit_and_nudge();
+            Some(id)
+        }
+
+        /// Reply to a comment, with consumer fields, then push. Returns the
+        /// reply's id, or `null` when the parent does not exist.
+        #[wasm_bindgen(js_name = replyComment)]
+        pub fn reply_comment(&self, parent: String, fields: JsValue) -> Option<String> {
+            let id = self.doc.comments().reply(
+                &parent,
+                js_sys::Date::now() as i64,
+                &crate::comments::fields_from_js(&fields),
+            )?;
+            self.commit_and_nudge();
+            Some(id)
+        }
+
+        /// Set one consumer field on a comment (a scalar: string, boolean,
+        /// number, or null), then push. Returns `false` when the comment does
+        /// not exist, the key is core-interpreted, or the value is not a scalar.
+        #[wasm_bindgen(js_name = setComment)]
+        pub fn set_comment(&self, id: String, key: String, value: JsValue) -> bool {
+            let Some(value) = crate::comments::value_from_js(&value) else {
+                return false;
+            };
+            if !self.doc.comments().set(&id, &key, value) {
+                return false;
+            }
+            self.commit_and_nudge();
+            true
+        }
+
+        /// Remove a comment, then push. Replies to it stay.
+        #[wasm_bindgen(js_name = removeComment)]
+        pub fn remove_comment(&self, id: String) {
+            self.doc.comments().remove(&id);
+            self.commit_and_nudge();
+        }
+
         /// Register `onLog(message: string)`.
         #[wasm_bindgen(js_name = onLog)]
         pub fn on_log(&self, callback: Function) {
@@ -231,6 +308,13 @@ mod client {
         #[wasm_bindgen(js_name = onFileContent)]
         pub fn on_file_content(&self, callback: Function) {
             *self.callbacks.on_file_content.borrow_mut() = Some(callback);
+        }
+
+        /// Register `onComments(comments: Comment[])`, fired with the full
+        /// comment list on every doc change.
+        #[wasm_bindgen(js_name = onComments)]
+        pub fn on_comments(&self, callback: Function) {
+            *self.callbacks.on_comments.borrow_mut() = Some(callback);
         }
 
         /// Register `onDisconnect(reason: string)`.
@@ -279,11 +363,16 @@ mod client {
             match changed.recv().await {
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     let files = collect_files(&doc);
-                    let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+                    let paths: Vec<String> = files.iter().map(|(p, _, _)| p.clone()).collect();
                     callbacks.files(&paths);
-                    for (path, content) in files {
+                    let nodes: Vec<(String, TreeID)> = files
+                        .iter()
+                        .map(|(p, n, _)| (p.clone(), *n))
+                        .collect();
+                    for (path, _, content) in files {
                         callbacks.file_content(&path, &content);
                     }
+                    callbacks.comments(&crate::comments::to_js(&doc, &nodes));
                 }
                 // The client (and its sender) was dropped; nothing more to do.
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -291,16 +380,16 @@ mod client {
         }
     }
 
-    /// Every file in the doc as `(path, content)`, directories flattened into
-    /// `a/b/c` paths.
-    fn collect_files(doc: &Doc) -> Vec<(String, String)> {
+    /// Every file in the doc as `(path, node, content)`, directories flattened
+    /// into `a/b/c` paths.
+    fn collect_files(doc: &Doc) -> Vec<(String, TreeID, String)> {
         let tree = doc.files();
         let mut out = Vec::new();
         fn rec(
             tree: &FileTree<'_>,
             node: TreeID,
             prefix: &str,
-            out: &mut Vec<(String, String)>,
+            out: &mut Vec<(String, TreeID, String)>,
         ) {
             let Some(name) = tree.name(node) else { return };
             let path = if prefix.is_empty() {
@@ -314,7 +403,7 @@ mod client {
                         .content(node)
                         .map(|t| t.to_string())
                         .unwrap_or_default();
-                    out.push((path, content));
+                    out.push((path, node, content));
                 }
                 Some(NodeKind::Dir) => {
                     for child in tree.children(node) {
