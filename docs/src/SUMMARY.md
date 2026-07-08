@@ -10,7 +10,10 @@
 - [Remotes](concepts/remotes.md)
 - [Transports](concepts/transports.md)
 - [Collaboration](concepts/collaboration.md)
+- [Materialization](concepts/materialization.md)
 
 # Design notes
 
 - [Repository layout](design/repo-layout.md)
+- [Materialization](design/materialization.md)
+- [Editor integration](design/editor-integration.md)
