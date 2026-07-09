@@ -7,7 +7,7 @@
 
 pub use loro::TreeID;
 
-use loro::{LoroMap, LoroText, UpdateOptions};
+use loro::{ExportMode, Frontiers, LoroMap, LoroText, UpdateOptions};
 
 use crate::Doc;
 
@@ -169,6 +169,50 @@ impl FileTree<'_> {
         }
     }
 
+    /// Set a file node's content to `text`, diffing against the doc as of
+    /// `base` instead of its current state.
+    ///
+    /// This is the ingest primitive for external byte-level edits under
+    /// concurrency. A file on disk only carries final state, so turning it into
+    /// ops needs a three-way merge: the diff must be computed against the
+    /// content this text had when the file was last reconciled (`base`), and
+    /// any ops that landed since must survive. [`set_content`](Self::set_content)
+    /// diffs against the live state, which silently deletes concurrent peer
+    /// edits the file never saw.
+    ///
+    /// The edit is made on a fork of the doc pinned at `base` and merged back
+    /// through an import, so Loro reconciles it with concurrent ops by CRDT
+    /// causality rather than by byte positions. Returns `false` when the edit
+    /// cannot be expressed at `base` (the node was not a file there, or `base`
+    /// is not in this doc's history); the caller decides how to fall back.
+    pub fn set_content_at(&self, node: TreeID, text: &str, base: &Frontiers) -> bool {
+        let doc = self.doc.inner();
+        let Ok(fork) = doc.fork_at(base) else {
+            return false;
+        };
+
+        let Some(content) = fork
+            .get_tree(Self::TREE)
+            .get_meta(node)
+            .ok()
+            .and_then(|meta| meta.get("content"))
+            .and_then(|v| v.into_container().ok())
+            .and_then(|c| c.into_text().ok())
+        else {
+            return false;
+        };
+
+        if content.update(text, UpdateOptions::default()).is_err() {
+            return false;
+        }
+        fork.commit();
+
+        let Ok(updates) = fork.export(ExportMode::updates(&doc.state_vv())) else {
+            return false;
+        };
+        doc.import(&updates).is_ok()
+    }
+
     /// A boundary node's reference. `None` for files and directories.
     pub fn reference(&self, node: TreeID) -> Option<String> {
         self.string_field(node, "ref")
@@ -241,6 +285,43 @@ mod tests {
 
         assert_eq!(files.name(node).as_deref(), Some("final.txt"));
         assert_eq!(files.kind(node), Some(NodeKind::File));
+    }
+
+    #[test]
+    fn set_content_at_preserves_concurrent_peer_edits() {
+        let doc = Doc::new();
+        let files = doc.files();
+        let node = files.create_file(None, "notes.txt");
+        files.content(node).unwrap().insert(0, "hello").unwrap();
+        doc.commit();
+        let base = doc.frontiers();
+
+        // A peer edit lands after the base was taken.
+        let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
+        peer.files().content(node).unwrap().insert(5, "!").unwrap();
+        peer.commit();
+        doc.import(&peer.updates_since(&doc.version()).unwrap()).unwrap();
+        assert_eq!(files.content(node).unwrap().to_string(), "hello!");
+
+        // An external edit made against the base ("hello") must not delete it.
+        assert!(files.set_content_at(node, "hello world", &base));
+        let merged = files.content(node).unwrap().to_string();
+        assert!(merged.contains("world"), "local edit lost: {merged:?}");
+        assert!(merged.contains('!'), "peer edit lost: {merged:?}");
+    }
+
+    #[test]
+    fn set_content_at_refuses_an_unknown_base() {
+        let doc = Doc::new();
+        let files = doc.files();
+        let node = files.create_file(None, "a.txt");
+        doc.commit();
+
+        let other = Doc::new();
+        other.files().create_file(None, "b.txt");
+        other.commit();
+
+        assert!(!files.set_content_at(node, "x", &other.frontiers()));
     }
 
     #[test]

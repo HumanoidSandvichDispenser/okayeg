@@ -32,7 +32,7 @@ pub fn restore(file: &Path, dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let ws = CapWorkspace::open(dir)?;
     let doc = Doc::from_snapshot(&fs::read(file)?).map_err(to_io)?;
-    let files = export_tree(&doc, &ws)?;
+    let files = export_tree(&doc, &ws)?.len();
     println!(
         "restore: {files} file(s) from {} -> {}",
         file.display(),
@@ -103,10 +103,11 @@ fn import_dir(
     Ok(())
 }
 
-/// Write the doc's tree out into the workspace. Returns the file count.
-pub fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<usize> {
+/// Write the doc's tree out into the workspace. Returns the written file
+/// paths, which the caller uses to advance per-file merge bases.
+pub fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<Vec<std::path::PathBuf>> {
     let ignorer = Ignorer::load(ws)?;
-    let mut files = 0;
+    let mut files = Vec::new();
     for node in doc.files().roots() {
         // do not materialize any files in .eg
         if doc.files().name(node).as_deref() == Some(EG_DIR) {
@@ -139,7 +140,7 @@ fn export_node(
     ignorer: &Ignorer,
     node: TreeID,
     parent: &Path,
-    files: &mut usize,
+    files: &mut Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     let tree = doc.files();
     let Some(name) = tree.name(node) else {
@@ -167,7 +168,7 @@ fn export_node(
         Some(NodeKind::File) => {
             let text = tree.content(node).map(|c| c.to_string()).unwrap_or_default();
             ws.write_file(&rel, text.as_bytes())?;
-            *files += 1;
+            files.push(rel);
         }
         // Boundaries point at another doc; nothing to write inline yet.
         Some(NodeKind::Boundary) | None => {}
@@ -202,7 +203,7 @@ mod tests {
         let bytes = doc.snapshot().unwrap();
         let restored_doc = Doc::from_snapshot(&bytes).unwrap();
         let dst = MemWorkspace::new();
-        let exported = export_tree(&restored_doc, &dst).unwrap();
+        let exported = export_tree(&restored_doc, &dst).unwrap().len();
         assert_eq!(exported, 3);
 
         // The restored files should match the originals.
@@ -247,7 +248,7 @@ mod tests {
         doc.commit();
 
         // Export completes (no aborting error) and writes only the safe file.
-        let files = export_tree(&doc, &ws).unwrap();
+        let files = export_tree(&doc, &ws).unwrap().len();
         assert_eq!(files, 1, "only ok.txt should materialize");
         assert_eq!(ws.read_file(Path::new("ok.txt")).unwrap(), b"ok");
         // Nothing escaped the root.
@@ -273,7 +274,7 @@ mod tests {
         doc.commit();
 
         let ws = MemWorkspace::new();
-        let files = export_tree(&doc, &ws).unwrap();
+        let files = export_tree(&doc, &ws).unwrap().len();
 
         assert_eq!(files, 1, "only README.md should be written, not .eg/key");
         assert_eq!(ws.read_file(Path::new("README.md")).unwrap(), b"ok");
@@ -298,7 +299,7 @@ mod tests {
         // And the ignored paths must not have been materialized on export either.
         let dst = MemWorkspace::new();
         dst.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n").unwrap();
-        let exported = export_tree(&doc, &dst).unwrap();
+        let exported = export_tree(&doc, &dst).unwrap().len();
         assert_eq!(exported, 1);
         assert_eq!(dst.read_file(Path::new("README.md")).unwrap(), b"ok\n");
         assert!(dst.read_file(Path::new("secrets.env")).is_err());

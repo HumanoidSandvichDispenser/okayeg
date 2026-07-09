@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::trust::{self, Trust};
-use crate::watch::apply_path;
+use crate::watch;
 use crate::workspace::{CapWorkspace, Workspace};
 use crate::bridge::{export_tree, import_tree, safe_component};
 use crate::to_io;
@@ -106,7 +106,7 @@ fn is_empty_repo(ws: &dyn Workspace) -> io::Result<bool> {
     }))
 }
 
-fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<usize> {
+fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<Vec<PathBuf>> {
     ws.write_private(Path::new(DOC_PATH), &doc.snapshot().map_err(to_io)?)?;
     export_tree(doc, ws)
 }
@@ -312,7 +312,7 @@ pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
         let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
         node.sync_with(id, &doc).await.map_err(to_io)?;
-        let files = store(&doc, &ws)?;
+        let files = store(&doc, &ws)?.len();
         println!(
             "eg pull: synced with {id}, wrote {files} file(s) to {}",
             dir.display()
@@ -325,12 +325,18 @@ pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
 /// repo-wide change nudge. The watcher folds local edits in (firing the nudge
 /// when they move the doc); the exporter writes the doc back out on every nudge,
 /// whatever its source.
+///
+/// The two tasks share the per-file merge bases: the exporter advances a file's
+/// base whenever it writes it to disk, and the ingest side diffs an edited file
+/// against its base so peer ops that landed since the file last matched disk
+/// survive the merge.
 fn spawn_watch_and_export(
     ws: Rc<CapWorkspace>,
     base: PathBuf,
     doc: Shared,
 ) -> io::Result<broadcast::Sender<()>> {
     let (changed, _) = broadcast::channel::<()>(64);
+    let bases = Rc::new(RefCell::new(watch::seed_bases(&*ws, &doc)));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut debouncer = new_debouncer(
@@ -349,9 +355,11 @@ fn spawn_watch_and_export(
     let in_ws = ws.clone();
     let in_doc = doc.clone();
     let in_changed = changed.clone();
+    let in_bases = bases.clone();
     tokio::task::spawn_local(async move {
         // hold the watcher alive for as long as we drain it
         let _debouncer = debouncer;
+
         while let Some(res) = rx.recv().await {
             let events = match res {
                 Ok(events) => events,
@@ -362,24 +370,25 @@ fn spawn_watch_and_export(
                     continue;
                 }
             };
+
             let paths = changed_paths(&events, &base);
             if paths.is_empty() {
                 continue;
             }
-            let before = in_doc.version();
-            for rel in &paths {
-                if let Err(e) = apply_path(&*in_ws, &in_doc, rel) {
-                    eprintln!("eg: {e}");
+
+            match watch::apply_batch(&*in_ws, &in_doc, &paths, &mut in_bases.borrow_mut()) {
+                Ok(true) => {
+                    let _ = in_changed.send(());
                 }
-            }
-            in_doc.commit();
-            if in_doc.version() != before {
-                let _ = in_changed.send(());
+                Ok(false) => {}
+                Err(e) => eprintln!("eg: {e}"),
             }
         }
     });
 
-    // egress: on any nudge (local or peer), write the doc back to disk.
+    // egress: on any nudge (local or peer), write the doc back to disk. Every
+    // written file now matches the doc, so its merge base moves to the current
+    // frontier.
     let out_ws = ws;
     let out_doc = doc;
     let mut nudged = changed.subscribe();
@@ -387,11 +396,16 @@ fn spawn_watch_and_export(
         loop {
             match nudged.recv().await {
                 Err(broadcast::error::RecvError::Closed) => break,
-                _ => {
-                    if let Err(e) = store(&out_doc, &*out_ws) {
-                        eprintln!("eg: export: {e}");
+                _ => match store(&out_doc, &*out_ws) {
+                    Ok(written) => {
+                        let now = out_doc.frontiers();
+                        let mut bases = bases.borrow_mut();
+                        for path in written {
+                            bases.insert(path, now.clone());
+                        }
                     }
-                }
+                    Err(e) => eprintln!("eg: export: {e}"),
+                },
             }
         }
     });
