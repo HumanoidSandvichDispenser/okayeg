@@ -100,11 +100,45 @@ mod client {
         /// Create a peer: load the browser identity, open an empty doc, and start
         /// reflecting doc changes to the registered callbacks. The endpoint is
         /// bound lazily on the first [`connect`](Self::connect).
+        ///
+        /// The seed is loaded from (or minted into) localStorage by the wasm
+        /// binding itself. Prefer [`with_seed`](Self::with_seed) when the host
+        /// app owns identity persistence, so it controls where the seed lives
+        /// and knows when a fresh one was created (to upload its public half).
         #[wasm_bindgen(constructor)]
         pub fn new() -> Self {
+            Self::from_secret(identity::load_or_create())
+        }
+
+        /// Create a peer from a caller-supplied 32-byte seed. This lets the host
+        /// app own identity persistence (IndexedDB, etc.) and identity rotation,
+        /// rather than the binding reaching into localStorage. Errors if the seed
+        /// is not exactly 32 bytes.
+        #[wasm_bindgen(js_name = withSeed)]
+        pub fn with_seed(seed: &[u8]) -> Result<OkayegClient, JsValue> {
+            let seed: [u8; 32] = seed
+                .try_into()
+                .map_err(|_| JsValue::from_str("seed must be exactly 32 bytes"))?;
+            Ok(Self::from_secret(SecretKey::from_bytes(&seed)))
+        }
+
+        /// Mint a fresh 32-byte identity seed with the browser CSPRNG. The host
+        /// app persists this and passes it back to [`with_seed`](Self::with_seed);
+        /// the public half (see [`node_id`](Self::node_id)) is what a host
+        /// authorizes.
+        #[wasm_bindgen(js_name = generateSeed)]
+        pub fn generate_seed() -> Vec<u8> {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).expect("browser csprng");
+            seed.to_vec()
+        }
+
+        /// Shared construction: open an empty doc and start reflecting its
+        /// changes to the registered callbacks. Endpoint binds lazily on the
+        /// first [`connect`](Self::connect).
+        fn from_secret(secret: SecretKey) -> Self {
             let doc: Shared = Rc::new(Doc::new());
             let (changed, _) = broadcast::channel(64);
-            let secret = identity::load_or_create();
             let callbacks = Rc::new(Callbacks::default());
 
             spawn_local(reflect_changes(
