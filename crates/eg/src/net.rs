@@ -317,13 +317,14 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
 
 /// Pull from the peer named by `peer` (an endpoint id), merging into `dir`. One
 /// shot: clone or catch up, write the files, exit.
-pub fn pull(dir: &Path, peer: &str) -> std::io::Result<()> {
+pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
     let ws = open_repo(dir)?;
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
-        node.sync_with(id, &doc).await.map_err(to_io)?;
+        println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
+        node.sync_with(id, &doc, Duration::from_secs(timeout_secs)).await.map_err(to_io)?;
         let files = store(&doc, &ws)?.len();
         println!(
             "eg pull: synced with {id}, wrote {files} file(s) to {}",

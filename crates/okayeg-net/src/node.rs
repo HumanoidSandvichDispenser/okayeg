@@ -5,6 +5,8 @@
 //! actual protocol; this type just stands up the endpoint and hands it a bidirectional stream per
 //! peer.
 
+use std::time::Duration;
+
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
@@ -12,6 +14,15 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
 use crate::{drive, Accepted, Authorizer, Error, Transport, ALPN};
+
+/// How long a dial may take before we give up and report the peer unreachable.
+///
+/// iroh's own connect defaults are very generous (it keeps hole-punching for a
+/// p2p link that may just be slow to establish), so left alone a dial to an
+/// offline or dial-only peer never returns. This bounds it: long enough for a
+/// real relay/hole-punch handshake, short enough that a wrong or dead endpoint
+/// fails fast instead of hanging.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Generate a fresh 32-byte secret, the raw form of a node's identity.
 ///
@@ -75,12 +86,29 @@ impl Node {
     /// The dialer grants the peer full perms; access control is the accepting
     /// side's job. One-shot: used by `pull` to clone or catch up and exit. Live
     /// sessions go through [`Transport`] + [`drive_live`](crate::drive_live).
-    pub async fn sync_with(&self, peer: impl Into<EndpointAddr>, doc: &Doc) -> Result<(), Error> {
-        let conn = self
-            .endpoint
-            .connect(peer, ALPN)
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+    /// Connect to `peer`, giving up after `timeout` so an offline or dial-only
+    /// peer fails as [`Error::Unreachable`] instead of hanging forever.
+    async fn connect(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        timeout: Duration,
+    ) -> Result<Connection, Error> {
+        let peer = peer.into();
+        let id = peer.id;
+        match tokio::time::timeout(timeout, self.endpoint.connect(peer, ALPN)).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(Error::Transport(e.to_string())),
+            Err(_elapsed) => Err(Error::Unreachable(id.to_string())),
+        }
+    }
+
+    pub async fn sync_with(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        doc: &Doc,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let conn = self.connect(peer, timeout).await?;
         let (send, recv) = conn
             .open_bi()
             .await
@@ -106,11 +134,7 @@ impl Transport for Node {
     type Guard = Connection;
 
     async fn dial(&self, peer: EndpointId) -> Result<(SendStream, RecvStream, Connection), Error> {
-        let conn = self
-            .endpoint
-            .connect(peer, ALPN)
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let conn = self.connect(peer, DIAL_TIMEOUT).await?;
         let (send, recv) = conn
             .open_bi()
             .await

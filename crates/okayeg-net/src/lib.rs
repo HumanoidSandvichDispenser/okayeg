@@ -17,7 +17,7 @@ pub use authz::CommandAuthorizer;
 #[cfg(feature = "native")]
 pub use iroh::{EndpointAddr, EndpointId};
 #[cfg(feature = "native")]
-pub use node::{generate_secret, id_from_secret, Node};
+pub use node::{generate_secret, id_from_secret, Node, DIAL_TIMEOUT};
 pub use okayeg::Perms;
 
 /// A way to obtain live duplex connections to peers.
@@ -82,6 +82,13 @@ const MAX_FRAME: usize = 64 << 20;
 pub enum Error {
     /// The transport (iroh, or the underlying stream) failed.
     Transport(String),
+    /// The dial did not complete within its deadline. The peer is offline,
+    /// unreachable, or dial-only (a browser client that never accepts), so the
+    /// connection can never be established. Distinct from `Transport` so callers
+    /// can say "unreachable" rather than a generic failure. Carries the peer id
+    /// as a string to stay transport-agnostic (the enum is shared with wasm,
+    /// which has no iroh `EndpointId`).
+    Unreachable(String),
     /// The peer spoke the protocol wrong.
     Protocol(SyncError),
     /// A framed read or write failed.
@@ -92,6 +99,12 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Transport(s) => write!(f, "transport: {s}"),
+            Error::Unreachable(id) => write!(
+                f,
+                "peer {id} unreachable: dial timed out (offline, unreachable, \
+                 or a dial-only browser peer; if you meant a project, dial its \
+                 host endpoint, not a client)"
+            ),
             Error::Protocol(e) => write!(f, "protocol: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),
         }

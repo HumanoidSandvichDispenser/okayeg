@@ -46,7 +46,12 @@ enum Cmd {
     /// Serve this repo over iroh, live, for peers to sync.
     Serve,
     /// Pull current state from a peer, then exit.
-    Pull { peer: String },
+    Pull {
+        peer: String,
+        /// Seconds to wait for the dial before giving up as unreachable.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
     /// Clone if empty, then sync live with a peer.
     Join { peer: String },
     #[command(flatten)]
@@ -120,7 +125,7 @@ fn main() -> ExitCode {
         Cmd::Restore { input, dir } => bridge::restore(&input, &dir),
         Cmd::Watch { dir, out } => watch::watch(&dir, &out),
         Cmd::Serve => with_repo(dir, net::serve),
-        Cmd::Pull { peer } => with_fresh(dir, |d| net::pull(d, &peer)),
+        Cmd::Pull { peer, timeout } => with_fresh(dir, |d| net::pull(d, &peer, timeout)),
         Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer)),
         Cmd::Shared(cmd) => with_repo(dir, |d| cmd.run(d)),
     })

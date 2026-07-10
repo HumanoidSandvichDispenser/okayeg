@@ -9,7 +9,7 @@ default = ["native"]
 # The native transport: the iroh `Node` endpoint and the subprocess authorizer.
 # Disabled for wasm builds, which bring their own browser transport and reuse only
 # the (transport-generic) protocol loop, `Authorizer` trait, and `Perms`.
-native = ["dep:iroh", "tokio/rt", "tokio/process"]
+native = ["dep:iroh", "tokio/rt", "tokio/process", "tokio/time"]
 testing = []
 
 [dependencies]
