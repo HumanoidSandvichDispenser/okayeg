@@ -13,16 +13,18 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
-use crate::{drive, Accepted, Authorizer, Error, Transport, ALPN};
+use crate::{
+    drive, encode_refused, write_frame, Accepted, Authorizer, Decision, Error, Transport, ALPN,
+};
 
 /// How long a dial may take before we give up and report the peer unreachable.
-///
-/// iroh's own connect defaults are very generous (it keeps hole-punching for a
-/// p2p link that may just be slow to establish), so left alone a dial to an
-/// offline or dial-only peer never returns. This bounds it: long enough for a
-/// real relay/hole-punch handshake, short enough that a wrong or dead endpoint
-/// fails fast instead of hanging.
+/// iroh keeps hole-punching indefinitely otherwise, so a dead endpoint never
+/// returns. Long enough for a real handshake, short enough not to hang.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the accept side spends sending a refusal before moving on. Kept
+/// short so a slow dialer can't stall the accept loop.
+const REFUSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Generate a fresh 32-byte secret, the raw form of a node's identity.
 ///
@@ -81,13 +83,8 @@ impl Node {
         self.endpoint.addr()
     }
 
-    /// Dial `peer` and run one full sync of `doc` against it.
-    ///
-    /// The dialer grants the peer full perms; access control is the accepting
-    /// side's job. One-shot: used by `pull` to clone or catch up and exit. Live
-    /// sessions go through [`Transport`] + [`drive_live`](crate::drive_live).
-    /// Connect to `peer`, giving up after `timeout` so an offline or dial-only
-    /// peer fails as [`Error::Unreachable`] instead of hanging forever.
+    /// Connect to `peer`, giving up after `timeout` so an unreachable or
+    /// dial-only peer fails as [`Error::Unreachable`] instead of hanging.
     async fn connect(
         &self,
         peer: impl Into<EndpointAddr>,
@@ -102,6 +99,12 @@ impl Node {
         }
     }
 
+    /// Dial `peer` and run one full sync of `doc` against it, giving up on the
+    /// dial after `timeout`.
+    ///
+    /// The dialer grants the peer full perms; access control is the accepting
+    /// side's job. One-shot: used by `pull` to clone or catch up and exit. Live
+    /// sessions go through [`Transport`] + [`drive_live`](crate::drive_live).
     pub async fn sync_with(
         &self,
         peer: impl Into<EndpointAddr>,
@@ -156,16 +159,32 @@ impl Transport for Node {
             .map_err(|e| Error::Transport(e.to_string()))?;
         let who = conn.remote_id();
 
-        let Some(perms) = authz.authorize(who).await else {
-            // Untrusted: refuse before opening a stream.
-            conn.close(1u32.into(), b"not trusted");
-            return Ok(Accepted::Refused(who));
+        let message = match authz.authorize(who).await {
+            Decision::Grant(perms) => {
+                let (send, recv) = conn
+                    .accept_bi()
+                    .await
+                    .map_err(|e| Error::Transport(e.to_string()))?;
+                return Ok(Accepted::Peer { who, perms, send, recv, guard: conn });
+            }
+            Decision::Deny { message } => message,
         };
 
-        let (send, recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(Accepted::Peer { who, perms, send, recv, guard: conn })
+        // Refused. Send the message on the stream the dialer opened, then close,
+        // so it gets a clear refusal instead of a bare drop. Wait for the write
+        // to be acked before the connection drops, or the close cuts the frame
+        // off mid-flight. Bounded, so a slow dialer can't stall the loop.
+        let refuse = async {
+            let (mut send, _recv) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            write_frame(&mut send, &encode_refused(message.as_deref())).await?;
+            let _ = send.finish();
+            let _ = send.stopped().await;
+            Ok::<(), Error>(())
+        };
+        let _ = tokio::time::timeout(REFUSE_TIMEOUT, refuse).await;
+        Ok(Accepted::Refused { who, message })
     }
 }

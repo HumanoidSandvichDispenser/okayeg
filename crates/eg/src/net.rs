@@ -15,7 +15,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use okayeg::{Doc, NodeKind};
 use okayeg_net::{
-    drive_live, Accepted, Authorizer, CommandAuthorizer, EndpointId, Node, Perms, Shared,
+    drive_live, Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Node, Perms, Shared,
     Transport,
 };
 use tokio::sync::broadcast;
@@ -176,7 +176,10 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                     sessions.retain(|s| !s.handle.is_finished());
                     sessions.push(Session { who, perms, handle });
                 }
-                Accepted::Refused(who) => println!("eg serve: refused {who}"),
+                Accepted::Refused { who, message } => match message {
+                    Some(msg) => println!("eg serve: refused {who}: {msg}"),
+                    None => println!("eg serve: refused {who}"),
+                },
             }
         }
     })
@@ -283,13 +286,19 @@ enum Gate {
 impl Authorizer for Gate {
     type Id = EndpointId;
 
-    async fn authorize(&self, who: EndpointId) -> Option<Perms> {
+    async fn authorize(&self, who: EndpointId) -> Decision {
         match self {
             Gate::Trust(ws) => match Trust::load(&**ws) {
-                Ok(trust) => trust.perms(who),
+                Ok(trust) => match trust.perms(who) {
+                    Some(perms) => Decision::Grant(perms),
+                    // No grant for this peer. Tell it how to get one.
+                    None => Decision::Deny {
+                        message: Some("ask the owner to run `eg trust <your-id>`".into()),
+                    },
+                },
                 Err(e) => {
                     eprintln!("eg serve: cannot read .eg/trust, refusing: {e}");
-                    None
+                    Decision::Deny { message: None }
                 }
             },
             Gate::Command(authz) => authz.authorize(who).await,
@@ -309,7 +318,9 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
         println!("eg join: syncing live with {id} (ctrl-c to stop)");
         let (send, recv, _guard) = node.dial(id).await.map_err(to_io)?;
-        drive_live(doc, send, recv, Perms::all(), changed).await.map_err(to_io)?;
+        if let Err(e) = drive_live(doc, send, recv, Perms::all(), changed).await {
+            return Err(report_sync_error("eg join", &id, e));
+        }
         println!("eg join: link closed");
         Ok(())
     })
@@ -324,7 +335,9 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
         let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
-        node.sync_with(id, &doc, Duration::from_secs(timeout_secs)).await.map_err(to_io)?;
+        if let Err(e) = node.sync_with(id, &doc, Duration::from_secs(timeout_secs)).await {
+            return Err(report_sync_error("eg pull", &id, e));
+        }
         let files = store(&doc, &ws)?.len();
         println!(
             "eg pull: synced with {id}, wrote {files} file(s) to {}",
@@ -332,6 +345,31 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
         );
         Ok(())
     })
+}
+
+/// Turn a failed sync into an io error. On a refusal, print the peer's message
+/// under a `remote:` prefix; other errors pass straight through.
+fn report_sync_error(prog: &str, peer: &EndpointId, e: okayeg_net::Error) -> io::Error {
+    if let okayeg_net::Error::Refused { message } = &e {
+        println!("{prog}: rejected by {peer}");
+        if let Some(msg) = message {
+            // The peer chose this text, so strip control bytes before printing
+            // it: an escape sequence here would be a terminal injection.
+            for line in sanitize(msg).lines() {
+                println!("remote: {line}");
+            }
+        }
+        // Empty message: we already printed the refusal above, so `run` should
+        // stay quiet and just deliver the exit code.
+        return io::Error::new(io::ErrorKind::PermissionDenied, "");
+    }
+    to_io(e)
+}
+
+/// Drop control characters from peer text, keeping newlines so a multi-line
+/// message still lays out.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|&c| c == '\n' || !c.is_control()).collect()
 }
 
 /// Wire the FS watcher and disk exporter onto the shared doc, returning the

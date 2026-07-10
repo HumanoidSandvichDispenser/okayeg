@@ -11,7 +11,7 @@ mod authz;
 #[cfg(feature = "native")]
 mod node;
 
-pub use authz::{from_fn, Authorizer, FnAuthorizer};
+pub use authz::{from_fn, Authorizer, Decision, FnAuthorizer};
 #[cfg(feature = "native")]
 pub use authz::CommandAuthorizer;
 #[cfg(feature = "native")]
@@ -55,8 +55,12 @@ pub trait Transport {
 
 /// The outcome of [`Transport::accept`].
 pub enum Accepted<T: Transport + ?Sized> {
-    /// The gate refused this peer.
-    Refused(T::Id),
+    /// The gate refused this peer. The refusal was already sent; these fields
+    /// are for the accepting side to log.
+    Refused {
+        who: T::Id,
+        message: Option<String>,
+    },
     /// A trusted peer with its stream, ready to hand to [`drive_live`].
     Peer {
         who: T::Id,
@@ -77,18 +81,53 @@ pub const ALPN: &[u8] = b"okayeg/sync/0";
 /// Largest frame we will read to not allow a peer to make us allocate more than this much at once.
 const MAX_FRAME: usize = 64 << 20;
 
+/// First byte of a control frame. A sync [`Msg`] tags itself 0 or 1, so `0xFF`
+/// never clashes with one, and the dialer can tell a refusal from a sync reply.
+const CTRL_TAG: u8 = 0xFF;
+/// Control-frame kind: the peer refused the connection.
+const CTRL_REFUSED: u8 = 0;
+/// Cap on the refusal message, so a peer can't make us frame a huge string.
+const MAX_MESSAGE: usize = 512;
+
+/// Frame a refusal: control tag, kind, then the message bytes.
+fn encode_refused(message: Option<&str>) -> Vec<u8> {
+    let msg = message.unwrap_or("").as_bytes();
+    let msg = &msg[..msg.len().min(MAX_MESSAGE)];
+    let mut out = Vec::with_capacity(2 + msg.len());
+    out.push(CTRL_TAG);
+    out.push(CTRL_REFUSED);
+    out.extend_from_slice(msg);
+    out
+}
+
+/// Decode a frame as a sync [`Msg`], or as an [`Error`] when it is a control
+/// frame. A refusal becomes [`Error::Refused`] instead of an undecodable message.
+fn decode_frame(bytes: &[u8]) -> Result<Msg, Error> {
+    if bytes.first() != Some(&CTRL_TAG) {
+        return Ok(Msg::decode(bytes)?);
+    }
+    match bytes[1..].split_first() {
+        Some((&CTRL_REFUSED, msg)) => {
+            let message = (!msg.is_empty()).then(|| String::from_utf8_lossy(msg).into_owned());
+            Err(Error::Refused { message })
+        }
+        _ => Err(Error::Transport("unknown control frame".into())),
+    }
+}
+
 /// Something went wrong moving sync bytes.
 #[derive(Debug)]
 pub enum Error {
     /// The transport (iroh, or the underlying stream) failed.
     Transport(String),
-    /// The dial did not complete within its deadline. The peer is offline,
-    /// unreachable, or dial-only (a browser client that never accepts), so the
-    /// connection can never be established. Distinct from `Transport` so callers
-    /// can say "unreachable" rather than a generic failure. Carries the peer id
-    /// as a string to stay transport-agnostic (the enum is shared with wasm,
-    /// which has no iroh `EndpointId`).
+    /// The dial timed out: the peer is offline, unreachable, or dial-only (a
+    /// browser client that never accepts). Separate from `Transport` so callers
+    /// can say "unreachable". Holds the peer id as a string, since the enum is
+    /// shared with wasm and has no iroh type.
     Unreachable(String),
+    /// The peer authenticated our key but its authorizer refused the sync.
+    /// Carries any message it relayed.
+    Refused { message: Option<String> },
     /// The peer spoke the protocol wrong.
     Protocol(SyncError),
     /// A framed read or write failed.
@@ -99,6 +138,13 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Transport(s) => write!(f, "transport: {s}"),
+            Error::Refused { message } => {
+                write!(f, "refused by peer")?;
+                if let Some(msg) = message {
+                    write!(f, " ({msg})")?;
+                }
+                Ok(())
+            }
             Error::Unreachable(id) => write!(
                 f,
                 "peer {id} unreachable: dial timed out (offline, unreachable, \
@@ -137,7 +183,7 @@ where
     write_frame(&mut send, &sync.start().encode()).await?;
     loop {
         let frame = read_frame(&mut recv).await?;
-        match sync.on(Msg::decode(&frame)?)? {
+        match sync.on(decode_frame(&frame)?)? {
             Step::Send(msg) => write_frame(&mut send, &msg.encode()).await?,
             Step::Done => break,
         }
@@ -181,7 +227,7 @@ where
         tokio::select! {
             biased;
             (recv, frame) = &mut read => {
-                let out = live.on(&doc, Msg::decode(&frame?)?)?;
+                let out = live.on(&doc, decode_frame(&frame?)?)?;
                 read.set(next_frame(recv));
                 if let Some(msg) = out.send {
                     write_frame(&mut send, &msg.encode()).await?;
@@ -278,11 +324,14 @@ mod mem {
                 .recv()
                 .await
                 .ok_or_else(|| Error::Transport("peer gone".into()))?;
-            let Some(perms) = authz.authorize(who).await else {
-                return Ok(Accepted::Refused(who));
+            let message = match authz.authorize(who).await {
+                Decision::Grant(perms) => {
+                    let (recv, send) = split(stream);
+                    return Ok(Accepted::Peer { who, perms, send, recv, guard: () });
+                }
+                Decision::Deny { message } => message,
             };
-            let (recv, send) = split(stream);
-            Ok(Accepted::Peer { who, perms, send, recv, guard: () })
+            Ok(Accepted::Refused { who, message })
         }
     }
 }
@@ -295,6 +344,48 @@ mod tests {
     use super::*;
     use std::rc::Rc;
     use std::time::Duration;
+
+    #[test]
+    fn refusal_frame_round_trips() {
+        let framed = encode_refused(Some("ask the owner to trust you"));
+        match decode_frame(&framed) {
+            Err(Error::Refused { message }) => {
+                assert_eq!(message.as_deref(), Some("ask the owner to trust you"));
+            }
+            _ => panic!("expected Refused"),
+        }
+
+        // No message decodes to None, not an empty string.
+        assert!(matches!(
+            decode_frame(&encode_refused(None)),
+            Err(Error::Refused { message: None })
+        ));
+
+        // A real sync frame is untouched: its tag can never be the control tag.
+        let have = Msg::Have(vec![1, 2, 3]).encode();
+        assert!(matches!(decode_frame(&have), Ok(Msg::Have(_))));
+    }
+
+    #[tokio::test]
+    async fn drive_surfaces_a_refusal_read_off_the_stream() {
+        use tokio::io::{duplex, split};
+
+        let doc = Doc::new();
+        let (client, server) = duplex(4096);
+        let (client_r, client_w) = split(client);
+        let (_server_r, mut server_w) = split(server);
+
+        // The "accepting" side sends a refusal instead of a sync reply.
+        write_frame(&mut server_w, &encode_refused(Some("not trusted")))
+            .await
+            .unwrap();
+
+        let err = drive(&doc, client_w, client_r, Perms::all()).await.unwrap_err();
+        match err {
+            Error::Refused { message } => assert_eq!(message.as_deref(), Some("not trusted")),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
 
     /// Poll `pred` until true, yielding to let spawned tasks run; fail on timeout.
     async fn converge<F: Fn() -> bool>(pred: F) {
