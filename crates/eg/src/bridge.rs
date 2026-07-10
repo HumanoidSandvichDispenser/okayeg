@@ -118,22 +118,6 @@ pub fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<Vec<std::pa
     Ok(files)
 }
 
-/// Whether `name` is safe to materialize as a single path component.
-///
-/// A peer can push a tree node with any name, including `..` or one carrying a
-/// separator. Materializing it would have cap-std refuse the write and abort
-/// the whole export (so no legitimate file lands either), and once the node is
-/// persisted in `.eg/doc` that failure recurs on every later serve. Names that
-/// are not exactly one ordinary path component are skipped instead.
-pub fn safe_component(name: &str) -> bool {
-    use std::path::Component;
-    let mut comps = Path::new(name).components();
-    match (comps.next(), comps.next()) {
-        (Some(Component::Normal(c)), None) => c.to_str() == Some(name),
-        _ => false,
-    }
-}
-
 fn export_node(
     doc: &Doc,
     ws: &dyn Workspace,
@@ -146,9 +130,13 @@ fn export_node(
     let Some(name) = tree.name(node) else {
         return Ok(());
     };
-    // A peer-pushed node may carry an unsafe name; skip it (and its subtree)
-    // rather than let cap-std abort the whole export on it.
-    if !safe_component(&name) {
+    // A peer can push a tree node with any name, including `..` or one
+    // carrying a separator. Materializing it would have cap-std refuse the
+    // write and abort the whole export (so no legitimate file lands either),
+    // and once the node is persisted in `.eg/doc` that failure recurs on
+    // every later serve. A node whose name has no path is skipped instead,
+    // with its subtree.
+    if !okayeg::valid_name(&name) {
         eprintln!("eg: skipping tree node with unsafe name {name:?}");
         return Ok(());
     }
@@ -217,12 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn safe_component_rejects_traversal_and_separators() {
-        assert!(safe_component("ok.txt"));
-        assert!(safe_component(".hidden"));
-        assert!(safe_component("a file with spaces"));
+    fn valid_name_rejects_traversal_and_separators() {
+        assert!(okayeg::valid_name("ok.txt"));
+        assert!(okayeg::valid_name(".hidden"));
+        assert!(okayeg::valid_name("a file with spaces"));
         for bad in ["", ".", "..", "../pwned", "a/b", "/abs", "nested/"] {
-            assert!(!safe_component(bad), "{bad:?} should be rejected");
+            assert!(!okayeg::valid_name(bad), "{bad:?} should be rejected");
         }
     }
 

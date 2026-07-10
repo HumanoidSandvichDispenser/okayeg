@@ -59,7 +59,7 @@ pub struct FileTree<'a> {
 
 impl FileTree<'_> {
     /// The name of the tree container holding the file tree.
-    const TREE: &'static str = "files";
+    pub(crate) const TREE: &'static str = "files";
 
     fn tree(&self) -> loro::LoroTree {
         self.doc.inner().get_tree(Self::TREE)

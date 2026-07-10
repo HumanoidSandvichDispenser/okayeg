@@ -6,6 +6,7 @@
 
 mod bridge;
 mod config;
+mod filetree;
 mod ignore;
 mod net;
 mod trust;
@@ -67,6 +68,17 @@ enum SharedCmd {
         /// Any of `pull` / `push`; empty grants both.
         access: Vec<Access>,
     },
+    /// Lists the files in the specified directory in the doc.
+    Ls {
+        /// The path to list, relative to the doc root.
+        #[arg(default_value = "")]
+        path: String,
+    },
+    /// Print the contents of one or more files in the doc.
+    Cat {
+        /// The paths to print, relative to the doc root.
+        paths: Vec<String>,
+    },
 }
 
 impl SharedCmd {
@@ -76,6 +88,8 @@ impl SharedCmd {
             SharedCmd::Id => net::id(dir),
             SharedCmd::Status => net::status(dir),
             SharedCmd::Trust { peer, access } => net::trust(dir, &peer, perms_from(&access)),
+            SharedCmd::Ls { path } => filetree::ls_stdio(dir, &path),
+            SharedCmd::Cat { paths } => filetree::cat_stdio(dir, &paths),
         }
     }
 }
@@ -177,7 +191,13 @@ fn run(result: std::io::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("eg: {err}");
+            // An empty message means the command already reported the details
+            // itself and only the exit code is left to deliver, like cat
+            // failing after printing one line per unreadable path.
+            let msg = err.to_string();
+            if !msg.is_empty() {
+                eprintln!("eg: {msg}");
+            }
             ExitCode::FAILURE
         }
     }

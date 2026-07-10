@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use okayeg::{Doc, NodeKind, TreeID};
+use okayeg::{Doc, NodeKind};
 use okayeg_net::{
     drive_live, Accepted, Authorizer, CommandAuthorizer, EndpointId, Node, Perms, Shared,
     Transport,
@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::trust::{self, Trust};
 use crate::watch;
 use crate::workspace::{CapWorkspace, Workspace};
-use crate::bridge::{export_tree, import_tree, safe_component};
+use crate::bridge::{export_tree, import_tree};
 use crate::to_io;
 
 use crate::EG_DIR;
@@ -97,6 +97,18 @@ fn read_doc(ws: &dyn Workspace) -> io::Result<Option<Doc>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Load the doc last stored in this repo, failing when there is none yet.
+///
+/// One of three answers to a missing doc: `open_or_clone` requires an empty
+/// directory and starts fresh, `open_or_seed` imports the working tree, and
+/// this refuses. They could share a doc-opening seam once a fourth appears.
+pub(crate) fn load_doc(dir: &Path) -> io::Result<Doc> {
+    let ws = open_repo(dir)?;
+    read_doc(&ws)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no doc here yet; run serve, pull, or join first")
+    })
 }
 
 fn is_empty_repo(ws: &dyn Workspace) -> io::Result<bool> {
@@ -475,38 +487,24 @@ pub fn status(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Count the files and directories in a doc's tree, skipping the `.eg/` root
-/// and any unsafe-named node (and its subtree) just like [`export_tree`], so the
-/// reported count matches what export actually materializes.
+/// Count the files and directories in a doc's tree, skipping the `.eg/` root,
+/// so the reported count matches what export actually materializes. The walk
+/// already leaves out anything without a valid path, like export does.
 fn count_tree(doc: &Doc) -> (usize, usize) {
-    let tree = doc.files();
     let (mut files, mut dirs) = (0, 0);
-    for node in tree.roots() {
-        if tree.name(node).as_deref() == Some(EG_DIR) {
+    let eg_prefix = format!("{EG_DIR}/");
+
+    for (path, entry) in doc.fs().walk() {
+        if path == EG_DIR || path.starts_with(&eg_prefix) {
             continue;
         }
-        count_node(doc, node, &mut files, &mut dirs);
+        match entry.kind {
+            Some(NodeKind::Dir) => dirs += 1,
+            Some(NodeKind::File) => files += 1,
+            _ => {}
+        }
     }
     (files, dirs)
-}
-
-/// Tally one node and its children, pruning unsafe-named subtrees.
-fn count_node(doc: &Doc, node: TreeID, files: &mut usize, dirs: &mut usize) {
-    let tree = doc.files();
-    let Some(name) = tree.name(node) else { return };
-    if !safe_component(&name) {
-        return;
-    }
-    match tree.kind(node) {
-        Some(NodeKind::Dir) => {
-            *dirs += 1;
-            for child in tree.children(node) {
-                count_node(doc, child, files, dirs);
-            }
-        }
-        Some(NodeKind::File) => *files += 1,
-        _ => {}
-    }
 }
 
 /// Grant `peer` access to this repo, writing it into `.eg/trust`.
@@ -523,7 +521,7 @@ pub fn trust(dir: &Path, peer: &str, perms: Perms) -> io::Result<()> {
 }
 
 /// Open `dir` as a confined workspace, creating it (and `.eg/`) if needed.
-fn open_repo(dir: &Path) -> io::Result<CapWorkspace> {
+pub(crate) fn open_repo(dir: &Path) -> io::Result<CapWorkspace> {
     std::fs::create_dir_all(dir)?;
     let ws = CapWorkspace::open(dir)?;
     ws.create_dir(Path::new(EG_DIR))?;
