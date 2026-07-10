@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use iroh::address_lookup::PkarrResolver;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
@@ -62,7 +63,14 @@ impl Node {
 
     /// Bind an endpoint with a persisted secret, keeping a stable identity.
     pub async fn bind_with_secret(secret: [u8; 32]) -> Result<Self, Error> {
+        // The N0 preset resolves ids only over DNS off the system resolver. That
+        // breaks on hosts whose resolv.conf lists a nameserver the process cannot
+        // reach (Tailscale writes an IPv6 MagicDNS server that often times out,
+        // and VPNs do similar), leaving a dial with no addressing information even
+        // though the id is published. Add the HTTPS pkarr resolver the browser
+        // build already uses so lookups have a path that never touches resolv.conf.
         let endpoint = Endpoint::builder(presets::N0)
+            .address_lookup(PkarrResolver::n0_dns())
             .secret_key(SecretKey::from_bytes(&secret))
             .alpns(vec![ALPN.to_vec()])
             .bind()
