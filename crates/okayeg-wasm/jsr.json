@@ -1,0 +1,19 @@
+{
+  "name": "@sandvichxyz/okayeg-wasm",
+  "version": "0.1.0-3",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": "./pkg/okayeg_wasm.js",
+    "./wasm-url": "./wasm_url.js"
+  },
+  "publish": {
+    "include": [
+      "wasm_url.js",
+      "wasm_url.d.ts",
+      "pkg/okayeg_wasm.js",
+      "pkg/okayeg_wasm.d.ts",
+      "pkg/okayeg_wasm_bg.wasm",
+      "pkg/okayeg_wasm_bg.wasm.d.ts"
+    ]
+  }
+}
