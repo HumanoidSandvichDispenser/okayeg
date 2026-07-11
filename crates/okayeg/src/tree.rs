@@ -83,12 +83,7 @@ impl FileTree<'_> {
     }
 
     /// Create a boundary under `parent` pointing at another doc.
-    pub fn create_boundary(
-        &self,
-        parent: Option<TreeID>,
-        name: &str,
-        reference: &str,
-    ) -> TreeID {
+    pub fn create_boundary(&self, parent: Option<TreeID>, name: &str, reference: &str) -> TreeID {
         // currently a placeholder
         let node = self.create_node(parent, name, NodeKind::Boundary);
         let meta = self.meta(node).expect("new node has meta");
@@ -228,10 +223,7 @@ impl FileTree<'_> {
     /// kind. Descends into directories only; files, boundaries, and nodes with
     /// no metadata are leaves. Pass a filtered `roots` to leave out subtrees
     /// such as `.eg/`.
-    pub fn walk(
-        &self,
-        roots: impl IntoIterator<Item = TreeID>,
-    ) -> Vec<(TreeID, Option<NodeKind>)> {
+    pub fn walk(&self, roots: impl IntoIterator<Item = TreeID>) -> Vec<(TreeID, Option<NodeKind>)> {
         let mut stack: Vec<TreeID> = roots.into_iter().collect();
         let mut nodes = Vec::new();
         while let Some(node) = stack.pop() {
@@ -301,7 +293,8 @@ mod tests {
         let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
         peer.files().content(node).unwrap().insert(5, "!").unwrap();
         peer.commit();
-        doc.import(&peer.updates_since(&doc.version()).unwrap()).unwrap();
+        doc.import(&peer.updates_since(&doc.version()).unwrap())
+            .unwrap();
         assert_eq!(files.content(node).unwrap().to_string(), "hello!");
 
         // An external edit made against the base ("hello") must not delete it.

@@ -11,13 +11,13 @@ mod authz;
 #[cfg(feature = "native")]
 mod node;
 
-pub use authz::{from_fn, Authorizer, Decision, FnAuthorizer};
 #[cfg(feature = "native")]
 pub use authz::CommandAuthorizer;
+pub use authz::{Authorizer, Decision, FnAuthorizer, from_fn};
 #[cfg(feature = "native")]
 pub use iroh::{EndpointAddr, EndpointId};
 #[cfg(feature = "native")]
-pub use node::{generate_secret, id_from_secret, Node, DIAL_TIMEOUT};
+pub use node::{DIAL_TIMEOUT, Node, generate_secret, id_from_secret};
 pub use okayeg::Perms;
 
 /// A way to obtain live duplex connections to peers.
@@ -38,10 +38,7 @@ pub trait Transport {
     type Guard: 'static;
 
     /// Dial `peer`, returning its duplex stream and a lifetime guard.
-    async fn dial(
-        &self,
-        peer: Self::Id,
-    ) -> Result<(Self::Send, Self::Recv, Self::Guard), Error>;
+    async fn dial(&self, peer: Self::Id) -> Result<(Self::Send, Self::Recv, Self::Guard), Error>;
 
     /// Accept the next peer, gating it by id before handing back its stream.
     ///
@@ -57,10 +54,7 @@ pub trait Transport {
 pub enum Accepted<T: Transport + ?Sized> {
     /// The gate refused this peer. The refusal was already sent; these fields
     /// are for the accepting side to log.
-    Refused {
-        who: T::Id,
-        message: Option<String>,
-    },
+    Refused { who: T::Id, message: Option<String> },
     /// A trusted peer with its stream, ready to hand to [`drive_live`].
     Peer {
         who: T::Id,
@@ -357,8 +351,8 @@ async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, Error
 #[cfg(any(test, feature = "testing"))]
 mod mem {
     use super::*;
-    use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
+    use tokio::sync::{Mutex, mpsc};
 
     pub struct MemTransport {
         id: u64,
@@ -372,8 +366,16 @@ mod mem {
             let (a_tx, a_rx) = mpsc::unbounded_channel();
             let (b_tx, b_rx) = mpsc::unbounded_channel();
             (
-                MemTransport { id: 1, to_peer: b_tx, inbound: Mutex::new(a_rx) },
-                MemTransport { id: 2, to_peer: a_tx, inbound: Mutex::new(b_rx) },
+                MemTransport {
+                    id: 1,
+                    to_peer: b_tx,
+                    inbound: Mutex::new(a_rx),
+                },
+                MemTransport {
+                    id: 2,
+                    to_peer: a_tx,
+                    inbound: Mutex::new(b_rx),
+                },
             )
         }
     }
@@ -407,7 +409,13 @@ mod mem {
             let message = match authz.authorize(who).await {
                 Decision::Grant(perms) => {
                     let (recv, send) = split(stream);
-                    return Ok(Accepted::Peer { who, perms, send, recv, guard: () });
+                    return Ok(Accepted::Peer {
+                        who,
+                        perms,
+                        send,
+                        recv,
+                        guard: (),
+                    });
                 }
                 Decision::Deny { message } => message,
             };
@@ -460,7 +468,10 @@ mod tests {
         assert_eq!(decode_hello(&frame[2..]), Some(Identity::default()));
 
         // A field longer than the cap is truncated, not an error.
-        let long = Identity { name: Some("x".repeat(MAX_MESSAGE + 100)), email: None };
+        let long = Identity {
+            name: Some("x".repeat(MAX_MESSAGE + 100)),
+            email: None,
+        };
         let frame = encode_hello(&long);
         let decoded = decode_hello(&frame[2..]).unwrap();
         assert_eq!(decoded.name.unwrap().len(), MAX_MESSAGE);
@@ -475,8 +486,14 @@ mod tests {
         let (mut a_recv, mut a_send) = tokio::io::split(a);
         let (mut b_recv, mut b_send) = tokio::io::split(b);
 
-        let alice = Identity { name: Some("alice".into()), email: None };
-        let bob = Identity { name: Some("bob".into()), email: Some("bob@example.com".into()) };
+        let alice = Identity {
+            name: Some("alice".into()),
+            email: None,
+        };
+        let bob = Identity {
+            name: Some("bob".into()),
+            email: Some("bob@example.com".into()),
+        };
 
         let (a_got, b_got) = tokio::join!(
             hello(&mut a_send, &mut a_recv, &alice),
@@ -519,7 +536,9 @@ mod tests {
             .await
             .unwrap();
 
-        let err = drive(&doc, client_w, client_r, Perms::all()).await.unwrap_err();
+        let err = drive(&doc, client_w, client_r, Perms::all())
+            .await
+            .unwrap_err();
         match err {
             Error::Refused { message } => assert_eq!(message.as_deref(), Some("not trusted")),
             other => panic!("expected Refused, got {other:?}"),
@@ -543,7 +562,8 @@ mod tests {
             .run_until(async {
                 let (a, b) = MemTransport::pair();
                 let doc_a: Shared = Rc::new(Doc::new());
-                let doc_b: Shared = Rc::new(Doc::from_snapshot(&doc_a.snapshot().unwrap()).unwrap());
+                let doc_b: Shared =
+                    Rc::new(Doc::from_snapshot(&doc_a.snapshot().unwrap()).unwrap());
                 let (ca, _) = broadcast::channel::<()>(64);
                 let (cb, _) = broadcast::channel::<()>(64);
 
@@ -551,8 +571,11 @@ mod tests {
                 let bd = doc_b.clone();
                 let bc = cb.clone();
                 tokio::task::spawn_local(async move {
-                    if let Ok(Accepted::Peer { send, recv, perms, .. }) =
-                        b.accept(&from_fn(|_: u64| async { Some(Perms::all()) })).await
+                    if let Ok(Accepted::Peer {
+                        send, recv, perms, ..
+                    }) = b
+                        .accept(&from_fn(|_: u64| async { Some(Perms::all()) }))
+                        .await
                     {
                         let _ = drive_live(bd, send, recv, perms, bc).await;
                     }
@@ -613,7 +636,10 @@ mod tests {
 
         let merged = a.text("body").to_string();
         assert_eq!(merged, b.text("body").to_string());
-        assert!(merged.contains('A') && merged.contains('B'), "got {merged:?}");
+        assert!(
+            merged.contains('A') && merged.contains('B'),
+            "got {merged:?}"
+        );
     }
 
     // Regression for the C1 desync: a `changed` nudge that fires while a frame is
@@ -643,8 +669,8 @@ mod tests {
                 let ad = a.clone();
                 let drive_changed = changed.clone();
                 tokio::task::spawn_local(async move {
-                    let _ =
-                        drive_live(ad, tokio::io::sink(), a_recv, Perms::all(), drive_changed).await;
+                    let _ = drive_live(ad, tokio::io::sink(), a_recv, Perms::all(), drive_changed)
+                        .await;
                 });
 
                 // Deliver only the header, then let drive_live park mid-frame.

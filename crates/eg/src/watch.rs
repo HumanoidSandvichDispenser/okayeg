@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use okayeg::{Doc, Frontiers, NodeKind, TreeID};
 
 use crate::workspace::{CapWorkspace, Kind, Workspace};
@@ -59,8 +59,14 @@ pub fn seed_bases(ws: &dyn Workspace, doc: &Doc) -> FileBases {
                 }
             }
             Some(NodeKind::File) => {
-                let text = tree.content(node).map(|c| c.to_string()).unwrap_or_default();
-                if ws.read_file(&path).is_ok_and(|bytes| bytes == text.as_bytes()) {
+                let text = tree
+                    .content(node)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
+                if ws
+                    .read_file(&path)
+                    .is_ok_and(|bytes| bytes == text.as_bytes())
+                {
                     bases.insert(path, now.clone());
                 }
             }
@@ -249,8 +255,8 @@ fn ensure_dir(doc: &Doc, rel: &Path) -> Option<TreeID> {
     let tree = doc.files();
     let mut parent = None;
     for comp in components(rel) {
-        let node = child_named(doc, parent, &comp)
-            .unwrap_or_else(|| tree.create_dir(parent, &comp));
+        let node =
+            child_named(doc, parent, &comp).unwrap_or_else(|| tree.create_dir(parent, &comp));
         parent = Some(node);
     }
     parent
@@ -286,15 +292,20 @@ mod tests {
         let rel = || vec![PathBuf::from("src/main.rs")];
 
         // Create: a nested file appears, and gains a merge base.
-        ws.write_file(Path::new("src/main.rs"), b"fn main() {}").unwrap();
+        ws.write_file(Path::new("src/main.rs"), b"fn main() {}")
+            .unwrap();
         apply_batch(&ws, &doc, &rel(), &mut bases).unwrap();
 
         let node = node_at(&doc, Path::new("src/main.rs")).unwrap();
-        assert_eq!(doc.files().content(node).unwrap().to_string(), "fn main() {}");
+        assert_eq!(
+            doc.files().content(node).unwrap().to_string(),
+            "fn main() {}"
+        );
         assert!(bases.contains_key(Path::new("src/main.rs")));
 
         // Modify: same path, new content, same node (identity preserved).
-        ws.write_file(Path::new("src/main.rs"), b"fn main() { todo!() }").unwrap();
+        ws.write_file(Path::new("src/main.rs"), b"fn main() { todo!() }")
+            .unwrap();
         apply_batch(&ws, &doc, &rel(), &mut bases).unwrap();
 
         assert_eq!(node_at(&doc, Path::new("src/main.rs")), Some(node));
@@ -330,10 +341,12 @@ mod tests {
         let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
         peer.files().content(node).unwrap().insert(5, "!").unwrap();
         peer.commit();
-        doc.import(&peer.updates_since(&doc.version()).unwrap()).unwrap();
+        doc.import(&peer.updates_since(&doc.version()).unwrap())
+            .unwrap();
 
         // A local edit based on the pre-peer content lands on disk.
-        ws.write_file(Path::new("notes.txt"), b"hello world").unwrap();
+        ws.write_file(Path::new("notes.txt"), b"hello world")
+            .unwrap();
         apply_batch(&ws, &doc, &paths, &mut bases).unwrap();
 
         let merged = doc.files().content(node).unwrap().to_string();

@@ -9,5 +9,7 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 loro = "1.13.6"
+postcard = { version = "1", features = ["alloc"] }
+serde = "1"
 okayeg = { path = "crates/okayeg" }
 okayeg-net = { path = "crates/okayeg-net" }

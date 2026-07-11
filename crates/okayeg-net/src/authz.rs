@@ -70,7 +70,10 @@ where
     Fut: Future<Output = D>,
     D: Into<Decision>,
 {
-    FnAuthorizer { f, _id: std::marker::PhantomData }
+    FnAuthorizer {
+        f,
+        _id: std::marker::PhantomData,
+    }
 }
 
 /// An [`Authorizer`] backed by a closure. Built by [`from_fn`].
@@ -189,7 +192,10 @@ fn parse_verdict(stdout: &str) -> Decision {
     let mut lines = stdout.lines();
     let first = lines.next().unwrap_or("");
 
-    let mut perms = Perms { pull: false, push: false };
+    let mut perms = Perms {
+        pull: false,
+        push: false,
+    };
     for word in first.split_whitespace() {
         match word {
             "pull" => perms.pull = true,
@@ -239,25 +245,34 @@ mod tests {
     fn deny_carries_its_message() {
         assert_eq!(
             parse_verdict("deny\nregister at https://host/enroll?key=abc"),
-            Decision::Deny { message: Some("register at https://host/enroll?key=abc".into()) }
+            Decision::Deny {
+                message: Some("register at https://host/enroll?key=abc".into())
+            }
         );
         // A multi-line message is joined and trimmed.
         assert_eq!(
             parse_verdict("deny\nline one\nline two\n"),
-            Decision::Deny { message: Some("line one\nline two".into()) }
+            Decision::Deny {
+                message: Some("line one\nline two".into())
+            }
         );
     }
 
     #[test]
     fn option_perms_adapts_to_a_decision() {
-        assert_eq!(Decision::from(Some(Perms::all())), Decision::Grant(Perms::all()));
+        assert_eq!(
+            Decision::from(Some(Perms::all())),
+            Decision::Grant(Perms::all())
+        );
         assert_eq!(Decision::from(None), Decision::Deny { message: None });
     }
 
     #[tokio::test]
     async fn command_grants_from_script_output() {
         // A "script" that prints a verdict regardless of the peer id.
-        let authz = CommandAuthorizer::<u64>::new("sh").arg("-c").arg("echo pull push");
+        let authz = CommandAuthorizer::<u64>::new("sh")
+            .arg("-c")
+            .arg("echo pull push");
         assert_eq!(authz.authorize(7).await, grant(true, true));
     }
 
@@ -275,25 +290,21 @@ mod tests {
     async fn command_that_ignores_stdin_still_decides() {
         // `false` exits without reading; the EPIPE on our stdin write must not
         // mask the exit status, and a fast blanket grant must still land.
-        let authz = CommandAuthorizer::<u64>::new("sh").arg("-c").arg("exec echo pull");
+        let authz = CommandAuthorizer::<u64>::new("sh")
+            .arg("-c")
+            .arg("exec echo pull");
         assert_eq!(authz.authorize(7).await, grant(true, false));
     }
 
     #[tokio::test]
     async fn nonzero_exit_refuses() {
         let authz = CommandAuthorizer::<u64>::new("false");
-        assert_eq!(
-            authz.authorize(1).await,
-            Decision::Deny { message: None }
-        );
+        assert_eq!(authz.authorize(1).await, Decision::Deny { message: None });
     }
 
     #[tokio::test]
     async fn failure_to_spawn_refuses() {
         let authz = CommandAuthorizer::<u64>::new("definitely-not-a-real-program-okayeg");
-        assert_eq!(
-            authz.authorize(1).await,
-            Decision::Deny { message: None }
-        );
+        assert_eq!(authz.authorize(1).await, Decision::Deny { message: None });
     }
 }

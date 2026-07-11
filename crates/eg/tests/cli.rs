@@ -26,10 +26,7 @@ fn snapshot_then_restore_round_trips_a_directory() {
     let status = eg().arg("restore").arg(&out).arg(&dst).status().unwrap();
     assert!(status.success(), "restore failed");
 
-    assert_eq!(
-        fs::read(dst.join("README.md")).unwrap(),
-        b"hello okayeg\n"
-    );
+    assert_eq!(fs::read(dst.join("README.md")).unwrap(), b"hello okayeg\n");
     assert_eq!(
         fs::read(dst.join("sub").join("deep.txt")).unwrap(),
         b"nested\n"

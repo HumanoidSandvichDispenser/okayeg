@@ -11,7 +11,7 @@ use okayeg::{Doc, NodeKind, TreeID};
 
 use crate::ignore::Ignorer;
 use crate::workspace::{CapWorkspace, Entry, Workspace};
-use crate::{to_io, EG_DIR};
+use crate::{EG_DIR, to_io};
 
 /// Walk the directory at `dir` into a doc and write the snapshot to `out`.
 pub fn snapshot(dir: &Path, out: &Path) -> std::io::Result<()> {
@@ -154,7 +154,10 @@ fn export_node(
             }
         }
         Some(NodeKind::File) => {
-            let text = tree.content(node).map(|c| c.to_string()).unwrap_or_default();
+            let text = tree
+                .content(node)
+                .map(|c| c.to_string())
+                .unwrap_or_default();
             ws.write_file(&rel, text.as_bytes())?;
             files.push(rel);
         }
@@ -180,8 +183,10 @@ mod tests {
         // Build a tree in memory: README.md, src/main.rs, src/sub/deep.txt.
         let src = MemWorkspace::new();
         src.write_file(Path::new("README.md"), b"gib eg\n").unwrap();
-        src.write_file(Path::new("src/main.rs"), b"fn main() {}\n").unwrap();
-        src.write_file(Path::new("src/nested/deep.txt"), b"dark fantasies\n").unwrap();
+        src.write_file(Path::new("src/main.rs"), b"fn main() {}\n")
+            .unwrap();
+        src.write_file(Path::new("src/nested/deep.txt"), b"dark fantasies\n")
+            .unwrap();
 
         // Snapshot it into a doc, then restore into a fresh workspace.
         let doc = Doc::new();
@@ -240,7 +245,11 @@ mod tests {
         assert_eq!(files, 1, "only ok.txt should materialize");
         assert_eq!(ws.read_file(Path::new("ok.txt")).unwrap(), b"ok");
         // Nothing escaped the root.
-        assert!(!outside.exists(), "traversal escaped to {}", outside.display());
+        assert!(
+            !outside.exists(),
+            "traversal escaped to {}",
+            outside.display()
+        );
     }
 
     #[test]
@@ -275,10 +284,13 @@ mod tests {
     #[test]
     fn ignore_skips_imports_and_prunes_dirs() {
         let src = MemWorkspace::new();
-        src.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n").unwrap();
+        src.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n")
+            .unwrap();
         src.write_file(Path::new("README.md"), b"ok\n").unwrap();
-        src.write_file(Path::new("secrets.env"), b"hunter2\n").unwrap();
-        src.write_file(Path::new("target/build.o"), b"junk\n").unwrap();
+        src.write_file(Path::new("secrets.env"), b"hunter2\n")
+            .unwrap();
+        src.write_file(Path::new("target/build.o"), b"junk\n")
+            .unwrap();
 
         let doc = Doc::new();
         let imported = import_tree(&src, &doc).unwrap();
@@ -286,7 +298,8 @@ mod tests {
 
         // And the ignored paths must not have been materialized on export either.
         let dst = MemWorkspace::new();
-        dst.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n").unwrap();
+        dst.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n")
+            .unwrap();
         let exported = export_tree(&doc, &dst).unwrap().len();
         assert_eq!(exported, 1);
         assert_eq!(dst.read_file(Path::new("README.md")).unwrap(), b"ok\n");

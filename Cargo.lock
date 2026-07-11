@@ -2980,6 +2980,8 @@ name = "okayeg"
 version = "0.1.0"
 dependencies = [
  "loro",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

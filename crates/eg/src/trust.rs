@@ -121,8 +121,9 @@ impl Grant {
 /// [`Trust::perms`]), so this also serves to change or revoke a grant.
 pub fn add(ws: &dyn Workspace, id: EndpointId, perms: Perms) -> io::Result<()> {
     let mut text = match ws.read_file(Path::new(TRUST_PATH)) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };

@@ -30,7 +30,7 @@ mod client {
     use iroh::{Endpoint, EndpointId, SecretKey};
     use js_sys::{Array, Function};
     use okayeg::{Doc, FileTree, NodeKind, TreeID};
-    use okayeg_net::{drive_live, hello, Identity, Perms, Shared, ALPN};
+    use okayeg_net::{ALPN, Identity, Perms, Shared, drive_live, hello};
     use tokio::sync::broadcast;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
@@ -254,7 +254,8 @@ mod client {
                 }
             };
             let Some(node) = find_file(&self.doc, &path) else {
-                self.callbacks.log(&format!("edit to unknown file {path:?}"));
+                self.callbacks
+                    .log(&format!("edit to unknown file {path:?}"));
                 return;
             };
             let Some(content) = self.doc.files().content(node) else {
@@ -436,10 +437,8 @@ mod client {
                     let paths: Vec<String> = files.iter().map(|(p, _, _)| p.clone()).collect();
                     callbacks.files(&paths);
 
-                    let nodes: Vec<(String, TreeID)> = files
-                        .iter()
-                        .map(|(p, n, _)| (p.clone(), *n))
-                        .collect();
+                    let nodes: Vec<(String, TreeID)> =
+                        files.iter().map(|(p, n, _)| (p.clone(), *n)).collect();
                     for (path, _, content) in files {
                         callbacks.file_content(&path, &content);
                     }

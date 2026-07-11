@@ -18,6 +18,9 @@ pub enum Msg {
     Have(Vec<u8>),
     /// "Here is what you were missing." Carries exported updates.
     Updates(Vec<u8>),
+    /// Ephemeral state riding beside the sync, never entering the doc.
+    /// Carries encoded [`Presence`](crate::Presence) updates.
+    Ephemeral(Vec<u8>),
 }
 
 impl Msg {
@@ -26,6 +29,7 @@ impl Msg {
         let (tag, body) = match self {
             Msg::Have(b) => (0u8, b),
             Msg::Updates(b) => (1u8, b),
+            Msg::Ephemeral(b) => (2u8, b),
         };
         let mut out = Vec::with_capacity(1 + body.len());
         out.push(tag);
@@ -39,6 +43,7 @@ impl Msg {
         match tag {
             0 => Ok(Msg::Have(body.to_vec())),
             1 => Ok(Msg::Updates(body.to_vec())),
+            2 => Ok(Msg::Ephemeral(body.to_vec())),
             _ => Err(SyncError::Malformed),
         }
     }
@@ -209,7 +214,10 @@ pub struct Live {
 
 impl LiveSync {
     pub fn new(perms: Perms) -> Self {
-        Self { perms, acked: VersionVector::default() }
+        Self {
+            perms,
+            acked: VersionVector::default(),
+        }
     }
 
     /// Our opening message: the version we currently hold.
@@ -223,15 +231,30 @@ impl LiveSync {
             // Their opening version: catch them up from it.
             Msg::Have(vv) => {
                 self.acked = VersionVector::decode(&vv)?;
-                Ok(Live { send: self.pending(doc)?, changed: false })
+                Ok(Live {
+                    send: self.pending(doc)?,
+                    changed: false,
+                })
             }
             // Their new commits: import if allowed, report whether it moved us.
             Msg::Updates(bytes) if self.perms.push => {
                 let before = doc.version();
                 import_no_orphans(doc, &bytes)?;
-                Ok(Live { send: None, changed: doc.version() != before })
+                Ok(Live {
+                    send: None,
+                    changed: doc.version() != before,
+                })
             }
-            Msg::Updates(_) => Ok(Live { send: None, changed: false }),
+            Msg::Updates(_) => Ok(Live {
+                send: None,
+                changed: false,
+            }),
+            // ephemeral frames are routed before the driver; ignore one that
+            // slips through rather than fault the session
+            Msg::Ephemeral(_) => Ok(Live {
+                send: None,
+                changed: false,
+            }),
         }
     }
 
@@ -321,7 +344,10 @@ mod tests {
         // Both converge to the same text, and it is not lost on either side.
         let merged = a.text("body").to_string();
         assert_eq!(merged, b.text("body").to_string());
-        assert!(merged.contains('A') && merged.contains('B'), "got {merged:?}");
+        assert!(
+            merged.contains('A') && merged.contains('B'),
+            "got {merged:?}"
+        );
     }
 
     #[test]
@@ -333,17 +359,29 @@ mod tests {
         a.commit();
         let b = Doc::from_snapshot(&a.snapshot().unwrap()).unwrap();
 
-        a.files().content(node).unwrap().insert(5, " from A").unwrap();
+        a.files()
+            .content(node)
+            .unwrap()
+            .insert(5, " from A")
+            .unwrap();
         a.commit();
         b.files().content(node).unwrap().insert(0, "[B] ").unwrap();
         b.commit();
 
         sync_pair(&a, &b);
 
-        assert_eq!(a.files().roots().len(), 1, "should stay one file, not duplicate");
+        assert_eq!(
+            a.files().roots().len(),
+            1,
+            "should stay one file, not duplicate"
+        );
         assert_eq!(b.files().roots().len(), 1);
         let merged = a.files().content(node).unwrap().to_string();
-        assert_eq!(merged, b.files().content(node).unwrap().to_string(), "diverged");
+        assert_eq!(
+            merged,
+            b.files().content(node).unwrap().to_string(),
+            "diverged"
+        );
         assert!(
             merged.contains("from A") && merged.contains("[B]"),
             "lost an edit: {merged:?}"
@@ -362,10 +400,22 @@ mod tests {
         writer.commit();
 
         // keeper grants writer { pull, !push }; writer (the dialer) grants all.
-        sync_pair_gated(&keeper, Perms { pull: true, push: false }, &writer, Perms::all());
+        sync_pair_gated(
+            &keeper,
+            Perms {
+                pull: true,
+                push: false,
+            },
+            &writer,
+            Perms::all(),
+        );
 
         assert_eq!(keeper.text("body").to_string(), "kept", "push leaked in");
-        assert_eq!(writer.text("body").to_string(), "keptX", "pull was withheld");
+        assert_eq!(
+            writer.text("body").to_string(),
+            "keptX",
+            "pull was withheld"
+        );
     }
 
     #[test]
@@ -379,12 +429,26 @@ mod tests {
         reader.text("body").insert(0, "mine").unwrap();
         reader.commit();
 
-        sync_pair_gated(&keeper, Perms { pull: false, push: true }, &reader, Perms::all());
+        sync_pair_gated(
+            &keeper,
+            Perms {
+                pull: false,
+                push: true,
+            },
+            &reader,
+            Perms::all(),
+        );
 
         // reader pushed to keeper, so keeper saw reader's ops...
-        assert!(keeper.text("body").to_string().contains("mine"), "push was accepted");
+        assert!(
+            keeper.text("body").to_string().contains("mine"),
+            "push was accepted"
+        );
         // ...but keeper's "secret" never reached reader.
-        assert!(!reader.text("body").to_string().contains("secret"), "pull leaked out");
+        assert!(
+            !reader.text("body").to_string().contains("secret"),
+            "pull leaked out"
+        );
     }
 
     #[test]
@@ -397,7 +461,10 @@ mod tests {
         // handshake: each sends Have, each catches the other up.
         let to_a = lb.on(&b, la.start(&a)).unwrap();
         let to_b = la.on(&a, lb.start(&b)).unwrap();
-        assert!(to_a.send.is_none() && to_b.send.is_none(), "nothing to catch up yet");
+        assert!(
+            to_a.send.is_none() && to_b.send.is_none(),
+            "nothing to catch up yet"
+        );
 
         // a commits mid-session; its pending carries just the delta.
         a.text("body").insert(0, "hello").unwrap();
@@ -412,7 +479,10 @@ mod tests {
 
         // b, nudged by its own import, echoes a's ops back; a re-imports as a
         // no-op and reports no change, so the ping does not bounce.
-        let echo = lb.pending(&b).unwrap().expect("b re-sends what it just got");
+        let echo = lb
+            .pending(&b)
+            .unwrap()
+            .expect("b re-sends what it just got");
         assert!(!la.on(&a, echo).unwrap().changed, "echo must not move a");
     }
 

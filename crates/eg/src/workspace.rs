@@ -217,13 +217,18 @@ impl Workspace for MemWorkspace {
                 self.create_dir(parent)?;
             }
         }
-        self.files.borrow_mut().insert(rel.to_path_buf(), contents.to_vec());
+        self.files
+            .borrow_mut()
+            .insert(rel.to_path_buf(), contents.to_vec());
         Ok(())
     }
 
     fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
         if self.files.borrow().contains_key(rel) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, rel.display().to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                rel.display().to_string(),
+            ));
         }
         self.write_file(rel, contents)
     }
@@ -270,7 +275,10 @@ mod tests {
         assert_eq!(ws.read_file(Path::new("inside.txt")).unwrap(), b"ok");
 
         // Absolute paths and `..` traversal are refused.
-        assert!(ws.read_file(outside.path().join("secret").as_path()).is_err());
+        assert!(
+            ws.read_file(outside.path().join("secret").as_path())
+                .is_err()
+        );
         assert!(ws.write_file(Path::new("../escape.txt"), b"x").is_err());
         assert!(ws.read_file(Path::new("../../etc/passwd")).is_err());
 

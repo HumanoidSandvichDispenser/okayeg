@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use loro::{ContainerID, ContainerType, LoroText, Subscription, TreeParentId};
 
-use crate::tree::{FileTree, NodeKind, TreeID};
 use crate::Doc;
+use crate::tree::{FileTree, NodeKind, TreeID};
 
 /// Whether `name` can appear as one path component.
 ///
@@ -321,7 +321,7 @@ impl DocFs<'_> {
             match tree.kind(dest) {
                 Some(NodeKind::Dir) if !node_is_dir => return Err(FsError::NotADirectory),
                 Some(NodeKind::Dir) if !tree.children(dest).is_empty() => {
-                    return Err(FsError::NotEmpty)
+                    return Err(FsError::NotEmpty);
                 }
                 Some(NodeKind::Dir) => {}
                 _ if node_is_dir => return Err(FsError::NotAFile),
@@ -432,7 +432,11 @@ mod tests {
 
         let src = files.create_dir(None, "src");
         let main = files.create_file(Some(src), "main.rs");
-        files.content(main).unwrap().insert(0, "fn main() {}").unwrap();
+        files
+            .content(main)
+            .unwrap()
+            .insert(0, "fn main() {}")
+            .unwrap();
         let readme = files.create_file(None, "README.md");
         files.content(readme).unwrap().insert(0, "gib eg").unwrap();
 
@@ -460,7 +464,12 @@ mod tests {
         let doc = sample();
         let fs = doc.fs();
 
-        let root: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let root: Vec<String> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(root.contains(&"src".to_string()));
         assert!(root.contains(&"README.md".to_string()));
         assert_eq!(fs.readdir("README.md"), Err(FsError::NotADirectory));
@@ -479,7 +488,12 @@ mod tests {
         doc.commit();
         let fs = doc.fs();
 
-        let names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert_eq!(names.len(), 2, "invalid names listed: {names:?}");
         assert_eq!(fs.walk().len(), 3);
         assert_eq!(fs.path_of(bad), None);
@@ -495,7 +509,10 @@ mod tests {
         assert_eq!(fs.create_file("src/lib.rs"), Err(FsError::AlreadyExists));
         assert_eq!(fs.create_dir("src"), Err(FsError::AlreadyExists));
         assert_eq!(fs.create_file("no/such/parent.txt"), Err(FsError::NotFound));
-        assert_eq!(fs.create_file("README.md/child"), Err(FsError::NotADirectory));
+        assert_eq!(
+            fs.create_file("README.md/child"),
+            Err(FsError::NotADirectory)
+        );
         assert_eq!(fs.create_file(""), Err(FsError::InvalidPath));
     }
 
@@ -558,28 +575,35 @@ mod tests {
         let node = doc.fs().create_file("notes.txt").unwrap();
         doc.fs().text("notes.txt").unwrap().insert(0, "hi").unwrap();
         doc.commit();
-        assert_eq!(seen.lock().unwrap().drain(..).collect::<Vec<_>>(), [
-            Change::Created { node }
-        ]);
+        assert_eq!(
+            seen.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [Change::Created { node }]
+        );
 
         // Content, rename, and removal each report against the same node.
         doc.fs().text("notes.txt").unwrap().insert(2, "!").unwrap();
         doc.commit();
-        assert_eq!(seen.lock().unwrap().drain(..).collect::<Vec<_>>(), [
-            Change::Content { node }
-        ]);
+        assert_eq!(
+            seen.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [Change::Content { node }]
+        );
 
         doc.fs().rename("notes.txt", "src/notes.txt").unwrap();
         doc.commit();
-        assert!(seen.lock().unwrap().drain(..).collect::<Vec<_>>().contains(
-            &Change::Moved { node }
-        ));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .drain(..)
+                .collect::<Vec<_>>()
+                .contains(&Change::Moved { node })
+        );
 
         doc.fs().remove_file("src/notes.txt").unwrap();
         doc.commit();
-        assert_eq!(seen.lock().unwrap().drain(..).collect::<Vec<_>>(), [
-            Change::Removed { node }
-        ]);
+        assert_eq!(
+            seen.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [Change::Removed { node }]
+        );
     }
 
     #[test]
@@ -589,7 +613,11 @@ mod tests {
         let doc = sample();
         let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
         let node = peer.fs().resolve("README.md").unwrap();
-        peer.fs().text("README.md").unwrap().insert(0, "pls ").unwrap();
+        peer.fs()
+            .text("README.md")
+            .unwrap()
+            .insert(0, "pls ")
+            .unwrap();
         peer.commit();
 
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -598,7 +626,8 @@ mod tests {
             sink.lock().unwrap().extend_from_slice(changes);
         });
 
-        doc.import(&peer.updates_since(&doc.version()).unwrap()).unwrap();
+        doc.import(&peer.updates_since(&doc.version()).unwrap())
+            .unwrap();
         assert_eq!(*seen.lock().unwrap(), [Change::Content { node }]);
     }
 }

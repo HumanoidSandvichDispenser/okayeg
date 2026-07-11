@@ -12,20 +12,20 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use okayeg::{Doc, NodeKind};
 use okayeg_net::{
-    drive_live, hello, Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity,
-    Node, Perms, Shared, Transport,
+    Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity, Node, Perms, Shared,
+    Transport, drive_live, hello,
 };
 use tokio::sync::broadcast;
 
+use crate::bridge::{export_tree, import_tree};
 use crate::config::Config;
+use crate::to_io;
 use crate::trust::{self, Trust};
 use crate::watch;
 use crate::workspace::{CapWorkspace, Workspace};
-use crate::bridge::{export_tree, import_tree};
-use crate::to_io;
 
 use crate::EG_DIR;
 
@@ -93,7 +93,12 @@ fn label(identity: &Identity, who: &EndpointId) -> String {
 
 /// Report a session event to the `[session] command` hook, when one is
 /// configured. Fire and forget: the hook decides nothing, a failure only logs.
-fn run_session_hook(cmd: &Rc<Option<Vec<String>>>, event: &str, who: &EndpointId, identity: &Identity) {
+fn run_session_hook(
+    cmd: &Rc<Option<Vec<String>>>,
+    event: &str,
+    who: &EndpointId,
+    identity: &Identity,
+) {
     let Some(cmd) = cmd.as_ref() else { return };
 
     let stdin_body = format!(
@@ -211,7 +216,10 @@ fn read_doc(ws: &dyn Workspace) -> io::Result<Option<Doc>> {
 pub(crate) fn load_doc(dir: &Path) -> io::Result<Doc> {
     let ws = open_repo(dir)?;
     read_doc(&ws)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no doc here yet; run serve, pull, or join first")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no doc here yet; run serve, pull, or join first",
+        )
     })
 }
 
@@ -236,7 +244,9 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         let doc: Shared = Rc::new(open_or_seed(&*ws)?);
         store(&doc, &*ws)?;
 
-        let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
+        let node = Node::bind_with_secret(repo_secret(&*ws)?)
+            .await
+            .map_err(to_io)?;
         let _ = node.addr().await;
         let changed = spawn_watch_and_export(ws.clone(), base.clone(), doc.clone())?;
 
@@ -270,7 +280,13 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
-                Accepted::Peer { who, perms, mut send, mut recv, guard } => {
+                Accepted::Peer {
+                    who,
+                    perms,
+                    mut send,
+                    mut recv,
+                    guard,
+                } => {
                     let doc = doc.clone();
                     let changed = changed.clone();
                     let me = me.clone();
@@ -305,7 +321,12 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
                     let mut sessions = sessions.borrow_mut();
                     sessions.retain(|s| !s.handle.is_finished());
-                    sessions.push(Session { who, perms, identity, handle });
+                    sessions.push(Session {
+                        who,
+                        perms,
+                        identity,
+                        handle,
+                    });
                 }
                 Accepted::Refused { who, message } => match message {
                     Some(msg) => println!("eg serve: refused {who}: {msg}"),
@@ -385,7 +406,11 @@ fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path, hook: &Rc<Option<
             sessions.retain(|s| !s.handle.is_finished());
             println!("eg serve: {} session(s)", sessions.len());
             for s in sessions.iter() {
-                println!("  {} {}", label(&s.identity.borrow(), &s.who), trust::flags(s.perms));
+                println!(
+                    "  {} {}",
+                    label(&s.identity.borrow(), &s.who),
+                    trust::flags(s.perms)
+                );
             }
         }
         ReplCmd::Revoke { id } => {
@@ -452,7 +477,9 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc: Shared = Rc::new(open_or_clone(&*ws)?);
-        let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
+        let node = Node::bind_with_secret(repo_secret(&*ws)?)
+            .await
+            .map_err(to_io)?;
         let me = local_identity(&Config::load(&*ws)?, &base);
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
 
@@ -483,11 +510,16 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
-        let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
+        let node = Node::bind_with_secret(repo_secret(&ws)?)
+            .await
+            .map_err(to_io)?;
         let me = local_identity(&Config::load(&ws)?, dir);
 
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
-        let host = match node.sync_with(id, &doc, &me, Duration::from_secs(timeout_secs)).await {
+        let host = match node
+            .sync_with(id, &doc, &me, Duration::from_secs(timeout_secs))
+            .await
+        {
             Ok(host) => host,
             Err(e) => return Err(report_sync_error("eg pull", &id, e)),
         };
@@ -524,7 +556,9 @@ fn report_sync_error(prog: &str, peer: &EndpointId, e: okayeg_net::Error) -> io:
 /// Drop control characters from peer text, keeping newlines so a multi-line
 /// message still lays out.
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|&c| c == '\n' || !c.is_control()).collect()
+    s.chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
 }
 
 /// Wire the FS watcher and disk exporter onto the shared doc, returning the

@@ -330,7 +330,11 @@ mod tests {
         doc.commit();
 
         let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
-        peer.files().content(file).unwrap().insert(0, "ah, ").unwrap();
+        peer.files()
+            .content(file)
+            .unwrap()
+            .insert(0, "ah, ")
+            .unwrap();
         peer.commit();
 
         doc.import(&peer.updates_since(&doc.version()).unwrap())

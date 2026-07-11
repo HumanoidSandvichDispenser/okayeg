@@ -40,7 +40,9 @@ pub fn ls_stdio(eg_dir: &Path, path: &str) -> std::io::Result<()> {
             println!("{path}");
         }
         Err(e) => {
-            return Err(std::io::Error::other(format!("cannot access '{path}': {e}")));
+            return Err(std::io::Error::other(format!(
+                "cannot access '{path}': {e}"
+            )));
         }
     }
     Ok(())

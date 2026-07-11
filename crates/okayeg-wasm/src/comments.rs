@@ -7,9 +7,9 @@
 //! numbers, and null.
 
 use js_sys::{Array, Object, Reflect};
-use wasm_bindgen::JsCast as _;
 use loro::LoroValue;
 use okayeg::{Comment, Doc};
+use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 
 /// All comments in the doc as a JS array, file node ids resolved to paths

@@ -15,8 +15,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
 use crate::{
-    drive, encode_refused, hello, write_frame, Accepted, Authorizer, Decision, Error, Identity,
-    Transport, ALPN,
+    ALPN, Accepted, Authorizer, Decision, Error, Identity, Transport, drive, encode_refused, hello,
+    write_frame,
 };
 
 /// How long a dial may take before we give up and report the peer unreachable.
@@ -178,7 +178,13 @@ impl Transport for Node {
                     .accept_bi()
                     .await
                     .map_err(|e| Error::Transport(e.to_string()))?;
-                return Ok(Accepted::Peer { who, perms, send, recv, guard: conn });
+                return Ok(Accepted::Peer {
+                    who,
+                    perms,
+                    send,
+                    recv,
+                    guard: conn,
+                });
             }
             Decision::Deny { message } => message,
         };

@@ -69,8 +69,7 @@ impl Config {
     /// wrong shape, is an error, never a fallback to defaults.
     pub fn load(ws: &dyn Workspace) -> io::Result<Self> {
         let text = match ws.read_file(Path::new(CONFIG_PATH)) {
-            Ok(bytes) => String::from_utf8(bytes)
-                .map_err(|e| bad(format!("not utf-8: {e}")))?,
+            Ok(bytes) => String::from_utf8(bytes).map_err(|e| bad(format!("not utf-8: {e}")))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
         };
@@ -110,12 +109,20 @@ impl Config {
         let name = identity_field("name")?;
         let email = identity_field("email")?;
 
-        Ok(Self { authz_command, name, email, session_command })
+        Ok(Self {
+            authz_command,
+            name,
+            email,
+            session_command,
+        })
     }
 }
 
 fn bad(msg: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!(".eg/config.toml: {msg}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(".eg/config.toml: {msg}"),
+    )
 }
 
 #[cfg(test)]
@@ -125,12 +132,16 @@ mod tests {
     #[test]
     fn empty_and_unrelated_tables_mean_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
-        assert_eq!(Config::parse("[other]\nx = 1\n").unwrap(), Config::default());
+        assert_eq!(
+            Config::parse("[other]\nx = 1\n").unwrap(),
+            Config::default()
+        );
     }
 
     #[test]
     fn authz_command_parses_as_argv() {
-        let config = Config::parse("[authz]\ncommand = [\"/bin/authz\", \"project-42\"]\n").unwrap();
+        let config =
+            Config::parse("[authz]\ncommand = [\"/bin/authz\", \"project-42\"]\n").unwrap();
         assert_eq!(
             config.authz_command,
             Some(vec!["/bin/authz".to_owned(), "project-42".to_owned()])

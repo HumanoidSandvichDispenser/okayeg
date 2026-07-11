@@ -115,7 +115,8 @@ mod tests {
         // A peer with nothing yet catches up from the full update stream.
         let peer = Doc::new();
         let caught_up = peer.version();
-        peer.import(&doc.updates_since(&caught_up).unwrap()).unwrap();
+        peer.import(&doc.updates_since(&caught_up).unwrap())
+            .unwrap();
         assert_eq!(peer.text("body").to_string(), "hello");
 
         // A later edit ships as just the delta since the peer's version.

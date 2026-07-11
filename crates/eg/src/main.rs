@@ -25,7 +25,11 @@ const EG_DIR: &str = ".eg";
 
 /// The okayeg command line.
 #[derive(clap::Parser)]
-#[command(name = "eg", version, about = "Sync a directory of text files as an okayeg doc.")]
+#[command(
+    name = "eg",
+    version,
+    about = "Sync a directory of text files as an okayeg doc."
+)]
 struct Cli {
     /// Act as if run from <dir>, used by serve/pull/join/id/trust
     #[arg(short = 'C', value_name = "dir", global = true)]
@@ -227,15 +231,24 @@ mod tests {
         assert_eq!(perms_from(&[]), Perms::all());
         assert_eq!(
             perms_from(&[Access::Pull]),
-            Perms { pull: true, push: false }
+            Perms {
+                pull: true,
+                push: false
+            }
         );
         assert_eq!(
             perms_from(&[Access::Push]),
-            Perms { pull: false, push: true }
+            Perms {
+                pull: false,
+                push: true
+            }
         );
         assert_eq!(
             perms_from(&[Access::Push, Access::Pull, Access::Pull]),
-            Perms { pull: true, push: true }
+            Perms {
+                pull: true,
+                push: true
+            }
         );
     }
 }
