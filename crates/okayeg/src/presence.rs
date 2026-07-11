@@ -13,11 +13,9 @@ use std::collections::HashMap;
 
 use loro::awareness::{EphemeralStore, EphemeralSubscriber, LocalEphemeralCallback};
 use loro::{LoroValue, Subscription};
-use serde::de::{
-    DeserializeSeed, EnumAccess, Error as DeError, MapAccess, SeqAccess, VariantAccess, Visitor,
-};
-use serde::ser::{SerializeMap, Serializer};
-use serde::{Deserialize, Deserializer, Serialize};
+
+mod wire;
+use wire::Entry;
 
 /// A presence update did not parse, or Loro refused it.
 #[derive(Debug)]
@@ -109,7 +107,7 @@ impl Presence {
 
     /// Returns true if `key` is `owner` or a subkey under `owner/`.
     pub fn owns_key(owner: &str, key: &str) -> bool {
-        return key == owner || key.strip_prefix(owner).is_some_and(|r| r.starts_with('/'));
+        key == owner || key.strip_prefix(owner).is_some_and(|r| r.starts_with('/'))
     }
 
     /// Apply a peer's encoded updates, keeping only entries `owner` may write:
@@ -127,9 +125,7 @@ impl Presence {
         })
     }
 
-    /// Purge entries past their timeout, notifying subscribers of removals.
-    /// Nothing runs this on a schedule; until it runs, expiry only shows in
-    /// what gets encoded.
+    /// Remove outdated entries. See [`EphemeralStore::remove_outdated`].
     pub fn remove_outdated(&self) {
         self.store.remove_outdated();
     }
@@ -140,7 +136,7 @@ impl Presence {
         self.store.subscribe(callback)
     }
 
-    /// Watch local changes as encoded bytes, ready for the wire.
+    /// Watch local changes as encoded bytes.
     pub fn subscribe_local_updates(&self, callback: LocalEphemeralCallback) -> Subscription {
         self.store.subscribe_local_updates(callback)
     }
@@ -181,201 +177,9 @@ impl Presence {
     }
 }
 
-// Loro's EphemeralStore encodes as postcard over a sequence of
-// { key, Option<LoroValue>, timestamp } entries, and its apply() ingests a
-// payload whole, so filtering means decoding that layout here. Two deliberate
-// differences from a plain LoroValue decode: nesting is depth-limited, and
-// Container values are refused since a container reference has no meaning as
-// ephemeral state. The encoding is not public API; wire_matches_loro fails
-// loudly if a Loro upgrade changes it.
-
-/// One store entry as Loro lays it out on the wire. Field order is the format.
-#[derive(Serialize, Deserialize)]
-struct Entry {
-    key: String,
-    value: Option<Value>,
-    timestamp: i64,
-}
-
-/// LoroValue's wire shape, minus Container. Variant order (and the odd I32
-/// name for what holds an i64) must match LoroValue's serde derive exactly,
-/// since postcard encodes variants by index.
-enum Value {
-    Null,
-    Bool(bool),
-    Double(f64),
-    I64(i64),
-    String(String),
-    List(Vec<Value>),
-    // pairs, not a hash map, to re-encode in the exact order decoded
-    Map(Vec<(String, Value)>),
-    Binary(Vec<u8>),
-}
-
-/// How deep a value may nest; bounds a crafted payload's recursion.
-const MAX_DEPTH: usize = 64;
-
-const VARIANTS: &[&str] = &[
-    "Null",
-    "Bool",
-    "Double",
-    "I32",
-    "String",
-    "List",
-    "Map",
-    "Container",
-    "Binary",
-];
-
-impl Serialize for Value {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        const N: &str = "LoroValue";
-        match self {
-            Value::Null => s.serialize_unit_variant(N, 0, "Null"),
-            Value::Bool(v) => s.serialize_newtype_variant(N, 1, "Bool", v),
-            Value::Double(v) => s.serialize_newtype_variant(N, 2, "Double", v),
-            Value::I64(v) => s.serialize_newtype_variant(N, 3, "I32", v),
-            Value::String(v) => s.serialize_newtype_variant(N, 4, "String", v),
-            Value::List(v) => s.serialize_newtype_variant(N, 5, "List", v),
-            Value::Map(v) => s.serialize_newtype_variant(N, 6, "Map", &MapWire(v)),
-            Value::Binary(v) => s.serialize_newtype_variant(N, 8, "Binary", v),
-        }
-    }
-}
-
-/// Serializes key/value pairs through the map protocol, matching how a hash
-/// map lays out on the wire.
-struct MapWire<'a>(&'a [(String, Value)]);
-
-impl Serialize for MapWire<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = s.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0 {
-            m.serialize_entry(k, v)?;
-        }
-        m.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Value {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        ValueSeed { depth: MAX_DEPTH }.deserialize(d)
-    }
-}
-
-#[derive(Deserialize)]
-enum Tag {
-    Null,
-    Bool,
-    Double,
-    I32,
-    String,
-    List,
-    Map,
-    Container,
-    Binary,
-}
-
-#[derive(Clone, Copy)]
-struct ValueSeed {
-    depth: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for ValueSeed {
-    type Value = Value;
-
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-        d.deserialize_enum("LoroValue", VARIANTS, self)
-    }
-}
-
-impl<'de> Visitor<'de> for ValueSeed {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a presence value")
-    }
-
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Value, A::Error> {
-        let next = Self {
-            depth: self
-                .depth
-                .checked_sub(1)
-                .ok_or_else(|| A::Error::custom("presence value nests too deep"))?,
-        };
-
-        match data.variant()? {
-            (Tag::Null, v) => {
-                v.unit_variant()?;
-                Ok(Value::Null)
-            }
-            (Tag::Bool, v) => v.newtype_variant().map(Value::Bool),
-            (Tag::Double, v) => v.newtype_variant().map(Value::Double),
-            (Tag::I32, v) => v.newtype_variant().map(Value::I64),
-            (Tag::String, v) => v.newtype_variant().map(Value::String),
-            (Tag::List, v) => v.newtype_variant_seed(ListSeed(next)).map(Value::List),
-            (Tag::Map, v) => v.newtype_variant_seed(MapSeed(next)).map(Value::Map),
-            (Tag::Container, _) => Err(A::Error::custom("container values are not presence data")),
-            (Tag::Binary, v) => v.newtype_variant().map(Value::Binary),
-        }
-    }
-}
-
-struct ListSeed(ValueSeed);
-
-impl<'de> DeserializeSeed<'de> for ListSeed {
-    type Value = Vec<Value>;
-
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        d.deserialize_seq(self)
-    }
-}
-
-impl<'de> Visitor<'de> for ListSeed {
-    type Value = Vec<Value>;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a presence list")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut out = Vec::new();
-        while let Some(v) = seq.next_element_seed(self.0)? {
-            out.push(v);
-        }
-        Ok(out)
-    }
-}
-
-struct MapSeed(ValueSeed);
-
-impl<'de> DeserializeSeed<'de> for MapSeed {
-    type Value = Vec<(String, Value)>;
-
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        d.deserialize_map(self)
-    }
-}
-
-impl<'de> Visitor<'de> for MapSeed {
-    type Value = Vec<(String, Value)>;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a presence map")
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut out = Vec::new();
-        while let Some(k) = map.next_key::<String>()? {
-            let v = map.next_value_seed(self.0)?;
-            out.push((k, v));
-        }
-        Ok(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::wire::{MAX_DEPTH, Value};
     use super::*;
     use std::sync::{Arc, Mutex};
 
