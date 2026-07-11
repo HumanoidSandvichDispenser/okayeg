@@ -31,6 +31,7 @@ mod client {
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointId, SecretKey};
     use js_sys::{Array, Function, Object, Reflect};
+    use loro::cursor::{Cursor, Side};
     use okayeg::{Doc, FileTree, LoroValue, NodeKind, Presence, Subscription, TreeID};
     use okayeg_net::{ALPN, Perms, PresenceLink, Shared, drive_live};
     use tokio::sync::{broadcast, mpsc};
@@ -54,6 +55,7 @@ mod client {
         on_file_content: RefCell<Option<Function>>,
         on_comments: RefCell<Option<Function>>,
         on_presence: RefCell<Option<Function>>,
+        on_cursor: RefCell<Option<Function>>,
         on_disconnect: RefCell<Option<Function>>,
     }
 
@@ -93,6 +95,12 @@ mod client {
             }
         }
 
+        fn cursors(&self, cursors: &JsValue) {
+            if let Some(f) = self.on_cursor.borrow().as_ref() {
+                let _ = f.call1(&JsValue::NULL, cursors);
+            }
+        }
+
         fn disconnect(&self, reason: &str) {
             if let Some(f) = self.on_disconnect.borrow().as_ref() {
                 let _ = f.call1(&JsValue::NULL, &JsValue::from_str(reason));
@@ -113,6 +121,9 @@ mod client {
         /// The own entry as last set, re-set by the refresh task so it never
         /// expires while the tab lives.
         my_presence: Rc<RefCell<Option<LoroValue>>>,
+        /// The own cursor as last set (path, encoded anchor, encoded head),
+        /// re-set by the refresh task so it never expires while the tab lives.
+        my_cursor: Rc<RefCell<Option<(String, Vec<u8>, Vec<u8>)>>>,
         _presence_subs: (Subscription, Subscription),
     }
 
@@ -162,13 +173,15 @@ mod client {
             let (changed, _) = broadcast::channel(64);
             let callbacks = Rc::new(Callbacks::default());
 
+            let presence = Presence::new(PRESENCE_TIMEOUT_MS);
+
             spawn_local(reflect_changes(
                 doc.clone(),
+                presence.clone(),
                 changed.subscribe(),
                 callbacks.clone(),
             ));
 
-            let presence = Presence::new(PRESENCE_TIMEOUT_MS);
             let (relay, _) = broadcast::channel(64);
             let key = secret.public().to_string();
 
@@ -191,12 +204,19 @@ mod client {
             }));
             spawn_local(reflect_presence(
                 presence.clone(),
+                doc.clone(),
                 events_rx,
                 callbacks.clone(),
             ));
 
             let my_presence = Rc::new(RefCell::new(None));
-            spawn_local(refresh_presence(presence.clone(), key, my_presence.clone()));
+            let my_cursor = Rc::new(RefCell::new(None));
+            spawn_local(refresh_presence(
+                presence.clone(),
+                key,
+                my_presence.clone(),
+                my_cursor.clone(),
+            ));
 
             Self {
                 doc,
@@ -207,6 +227,7 @@ mod client {
                 presence,
                 relay,
                 my_presence,
+                my_cursor,
                 _presence_subs: (local_sub, events_sub),
             }
         }
@@ -415,6 +436,39 @@ mod client {
             presence_to_js(&self.presence)
         }
 
+        /// Set this peer's cursor: an `anchor`/`head` position (unicode
+        /// codepoint offset, half-open selection) in `path`. Encoded as loro
+        /// stable cursors so peers resolve it against their own doc as it
+        /// changes. Returns `false` when the file or a position does not exist.
+        /// Refreshes itself until [`clear_cursor`](Self::clear_cursor) or the
+        /// tab closes.
+        #[wasm_bindgen(js_name = setCursor)]
+        pub fn set_cursor(&self, path: String, anchor: usize, head: usize) -> bool {
+            let Some(node) = find_file(&self.doc, &path) else {
+                return false;
+            };
+            let Some(content) = self.doc.files().content(node) else {
+                return false;
+            };
+            let (Some(a), Some(h)) = (
+                content.get_cursor(anchor, Side::Left),
+                content.get_cursor(head, Side::Right),
+            ) else {
+                return false;
+            };
+            let (a, h) = (a.encode(), h.encode());
+            *self.my_cursor.borrow_mut() = Some((path.clone(), a.clone(), h.clone()));
+            self.presence.set_cursor(&self.node_id(), &path, &a, &h);
+            true
+        }
+
+        /// Drop this peer's cursor entry.
+        #[wasm_bindgen(js_name = clearCursor)]
+        pub fn clear_cursor(&self) {
+            *self.my_cursor.borrow_mut() = None;
+            self.presence.clear_cursor(&self.node_id());
+        }
+
         /// Register `onLog(message: string)`.
         #[wasm_bindgen(js_name = onLog)]
         pub fn on_log(&self, callback: Function) {
@@ -445,6 +499,15 @@ mod client {
         #[wasm_bindgen(js_name = onPresence)]
         pub fn on_presence(&self, callback: Function) {
             *self.callbacks.on_presence.borrow_mut() = Some(callback);
+        }
+
+        /// Register `onCursor(cursors: object)`, fired with every peer's
+        /// resolved cursor (keyed by peer node id, own entry included) on each
+        /// presence change *and* each doc change, since a concurrent edit moves
+        /// where a stable cursor resolves.
+        #[wasm_bindgen(js_name = onCursor)]
+        pub fn on_cursor(&self, callback: Function) {
+            *self.callbacks.on_cursor.borrow_mut() = Some(callback);
         }
 
         /// Register `onDisconnect(reason: string)`.
@@ -481,23 +544,28 @@ mod client {
         }
     }
 
-    /// On every store event, fire the presence callback with a fresh snapshot.
+    /// On every store event, fire the presence and cursor callbacks with fresh
+    /// snapshots.
     async fn reflect_presence(
         presence: Presence,
+        doc: Shared,
         mut events: mpsc::UnboundedReceiver<()>,
         callbacks: Rc<Callbacks>,
     ) {
         while events.recv().await.is_some() {
             callbacks.presence(&presence_to_js(&presence));
+            callbacks.cursors(&resolve_cursors(&doc, &presence));
         }
     }
 
-    /// Re-set the own entry and sweep expired peers, forever. The re-set is
-    /// the keepalive: it bumps the entry's timestamp and streams to the host.
+    /// Re-set the own entry and cursor and sweep expired peers, forever. The
+    /// re-set is the keepalive: it bumps the entry's timestamp and streams to
+    /// the host.
     async fn refresh_presence(
         presence: Presence,
         key: String,
         mine: Rc<RefCell<Option<LoroValue>>>,
+        cursor: Rc<RefCell<Option<(String, Vec<u8>, Vec<u8>)>>>,
     ) {
         loop {
             sleep_ms(PRESENCE_REFRESH_MS).await;
@@ -505,8 +573,38 @@ mod client {
             if let Some(value) = value {
                 presence.set(&key, value);
             }
+            let cursor = cursor.borrow().clone();
+            if let Some((file, anchor, head)) = cursor {
+                presence.set_cursor(&key, &file, &anchor, &head);
+            }
             presence.remove_outdated();
         }
+    }
+
+    /// Every peer's cursor resolved against the local doc, as a JS object keyed
+    /// by peer node id: `{ file, anchor, head, orphaned }` with integer
+    /// positions. A cursor whose file or anchor no longer resolves is skipped.
+    fn resolve_cursors(doc: &Doc, presence: &Presence) -> JsValue {
+        let out = Object::new();
+        for (ns, file, anchor, head) in presence.cursors() {
+            let (Ok(anchor), Ok(head)) = (Cursor::decode(&anchor), Cursor::decode(&head)) else {
+                continue;
+            };
+            let (Ok(a), Ok(h)) = (
+                doc.inner().get_cursor_pos(&anchor),
+                doc.inner().get_cursor_pos(&head),
+            ) else {
+                continue;
+            };
+            let obj = Object::new();
+            let _ = Reflect::set(&obj, &"file".into(), &JsValue::from_str(&file));
+            let _ = Reflect::set(&obj, &"anchor".into(), &JsValue::from_f64(a.current.pos as f64));
+            let _ = Reflect::set(&obj, &"head".into(), &JsValue::from_f64(h.current.pos as f64));
+            let orphaned = a.update.is_some() || h.update.is_some();
+            let _ = Reflect::set(&obj, &"orphaned".into(), &JsValue::from_bool(orphaned));
+            let _ = Reflect::set(&out, &JsValue::from_str(&ns), &obj);
+        }
+        out.into()
     }
 
     /// The store as a JS object: entry keys to objects of scalar fields.
@@ -546,6 +644,7 @@ mod client {
     /// `onEdit` deltas can come later.
     async fn reflect_changes(
         doc: Shared,
+        presence: Presence,
         mut changed: broadcast::Receiver<()>,
         callbacks: Rc<Callbacks>,
     ) {
@@ -564,6 +663,9 @@ mod client {
                     }
 
                     callbacks.comments(&crate::comments::to_js(&doc, &nodes));
+
+                    // a concurrent edit shifts where peers' stable cursors land
+                    callbacks.cursors(&resolve_cursors(&doc, &presence));
                 }
                 // The client (and its sender) was dropped; nothing more to do.
                 Err(broadcast::error::RecvError::Closed) => return,

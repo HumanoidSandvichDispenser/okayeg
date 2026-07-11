@@ -162,19 +162,39 @@ impl Presence {
     }
 
     pub fn get_cursor(&self, ns: &str) -> Option<(String, Vec<u8>, Vec<u8>)> {
-        let key = Self::cursor_key(ns);
-
-        self.get(&key).and_then(|value| {
-            if let LoroValue::Map(map) = value {
-                let file = map.get("file")?.as_string()?.to_string();
-                let anchor = map.get("anchor")?.as_binary()?.to_vec();
-                let head = map.get("head")?.as_binary()?.to_vec();
-                Some((file, anchor, head))
-            } else {
-                None
-            }
-        })
+        decode_cursor(self.get(&Self::cursor_key(ns))?)
     }
+
+    /// Clear this peer's cursor entry.
+    pub fn clear_cursor(&self, ns: &str) {
+        self.delete(&Self::cursor_key(ns));
+    }
+
+    /// Every live cursor, as `(ns, file, anchor, head)`. The anchor and head
+    /// are still encoded stable cursors; the caller resolves them against its
+    /// own doc.
+    pub fn cursors(&self) -> Vec<(String, String, Vec<u8>, Vec<u8>)> {
+        let suffix = format!("/{}", Self::CURSOR);
+        self.all()
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let ns = key.strip_suffix(&suffix)?.to_string();
+                let (file, anchor, head) = decode_cursor(value)?;
+                Some((ns, file, anchor, head))
+            })
+            .collect()
+    }
+}
+
+/// Unpack a cursor entry's map value into `(file, anchor, head)`.
+fn decode_cursor(value: LoroValue) -> Option<(String, Vec<u8>, Vec<u8>)> {
+    let LoroValue::Map(map) = value else {
+        return None;
+    };
+    let file = map.get("file")?.as_string()?.to_string();
+    let anchor = map.get("anchor")?.as_binary()?.to_vec();
+    let head = map.get("head")?.as_binary()?.to_vec();
+    Some((file, anchor, head))
 }
 
 #[cfg(test)]
