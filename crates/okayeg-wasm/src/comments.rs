@@ -65,7 +65,7 @@ fn comment_to_js(comment: &Comment, paths: &[(String, okayeg::TreeID)]) -> JsVal
     obj.into()
 }
 
-fn value_to_js(value: &LoroValue) -> JsValue {
+pub fn value_to_js(value: &LoroValue) -> JsValue {
     match value {
         LoroValue::Bool(b) => JsValue::from_bool(*b),
         LoroValue::Double(d) => JsValue::from_f64(*d),

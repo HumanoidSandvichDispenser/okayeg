@@ -26,17 +26,25 @@ mod client {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use std::collections::HashMap;
+
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointId, SecretKey};
-    use js_sys::{Array, Function};
-    use okayeg::{Doc, FileTree, NodeKind, TreeID};
-    use okayeg_net::{ALPN, Identity, Perms, Shared, drive_live, hello};
-    use tokio::sync::broadcast;
+    use js_sys::{Array, Function, Object, Reflect};
+    use okayeg::{Doc, FileTree, LoroValue, NodeKind, Presence, Subscription, TreeID};
+    use okayeg_net::{ALPN, Identity, Perms, PresenceLink, Shared, drive_live, hello};
+    use tokio::sync::{broadcast, mpsc};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
 
     use crate::identity;
     use crate::wire::WireDelta;
+
+    /// How long a presence entry lives without a refresh.
+    const PRESENCE_TIMEOUT_MS: i64 = 30_000;
+
+    /// How often the own entry is re-set and expired peers are swept.
+    const PRESENCE_REFRESH_MS: i32 = 10_000;
 
     /// JS callbacks the client fires. Each is optional until registered.
     #[derive(Default)]
@@ -46,6 +54,7 @@ mod client {
         on_file_content: RefCell<Option<Function>>,
         on_comments: RefCell<Option<Function>>,
         on_peer_identity: RefCell<Option<Function>>,
+        on_presence: RefCell<Option<Function>>,
         on_disconnect: RefCell<Option<Function>>,
     }
 
@@ -88,6 +97,12 @@ mod client {
             }
         }
 
+        fn presence(&self, peers: &JsValue) {
+            if let Some(f) = self.on_presence.borrow().as_ref() {
+                let _ = f.call1(&JsValue::NULL, peers);
+            }
+        }
+
         fn disconnect(&self, reason: &str) {
             if let Some(f) = self.on_disconnect.borrow().as_ref() {
                 let _ = f.call1(&JsValue::NULL, &JsValue::from_str(reason));
@@ -104,6 +119,12 @@ mod client {
         endpoint: Rc<RefCell<Option<Endpoint>>>,
         identity: RefCell<Identity>,
         callbacks: Rc<Callbacks>,
+        presence: Presence,
+        relay: broadcast::Sender<(String, Vec<u8>)>,
+        /// The own entry as last set, re-set by the refresh task so it never
+        /// expires while the tab lives.
+        my_presence: Rc<RefCell<Option<LoroValue>>>,
+        _presence_subs: (Subscription, Subscription),
     }
 
     #[wasm_bindgen]
@@ -158,6 +179,36 @@ mod client {
                 callbacks.clone(),
             ));
 
+            let presence = Presence::new(PRESENCE_TIMEOUT_MS);
+            let (relay, _) = broadcast::channel(64);
+            let key = secret.public().to_string();
+
+            // local set/delete flows to the host through the relay
+            let local_sub = {
+                let relay = relay.clone();
+                let key = key.clone();
+                presence.subscribe_local_updates(Box::new(move |bytes| {
+                    let _ = relay.send((key.clone(), bytes.clone()));
+                    true
+                }))
+            };
+
+            // store subscribers must be Send, so events hop to the JS callback
+            // through a channel drained by a local task
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let events_sub = presence.subscribe(Box::new(move |_| {
+                let _ = events_tx.send(());
+                true
+            }));
+            spawn_local(reflect_presence(
+                presence.clone(),
+                events_rx,
+                callbacks.clone(),
+            ));
+
+            let my_presence = Rc::new(RefCell::new(None));
+            spawn_local(refresh_presence(presence.clone(), key, my_presence.clone()));
+
             Self {
                 doc,
                 changed,
@@ -165,6 +216,10 @@ mod client {
                 endpoint: Rc::new(RefCell::new(None)),
                 identity: RefCell::new(Identity::default()),
                 callbacks,
+                presence,
+                relay,
+                my_presence,
+                _presence_subs: (local_sub, events_sub),
             }
         }
 
@@ -211,14 +266,19 @@ mod client {
             let doc = self.doc.clone();
             let changed = self.changed.clone();
             let callbacks = self.callbacks.clone();
+            // the dialed peer is the host, so it may carry every presence key
+            let link = PresenceLink {
+                presence: self.presence.clone(),
+                relay: self.relay.clone(),
+                owner: None,
+            };
             spawn_local(async move {
                 let _conn = conn; // hold the link open for the session
-                // TODO: pass a PresenceLink (owner None) once the browser
-                // presence API lands
-                let reason = match drive_live(doc, send, recv, Perms::all(), changed, None).await {
-                    Ok(()) => "peer closed".to_string(),
-                    Err(e) => format!("sync ended: {e}"),
-                };
+                let reason =
+                    match drive_live(doc, send, recv, Perms::all(), changed, Some(link)).await {
+                        Ok(()) => "peer closed".to_string(),
+                        Err(e) => format!("sync ended: {e}"),
+                    };
                 callbacks.disconnect(&reason);
             });
             Ok(())
@@ -357,6 +417,32 @@ mod client {
             self.commit_and_nudge();
         }
 
+        /// Set this peer's presence entry: an object of scalar fields (such as
+        /// `{name, email}`), shared live with every peer on the project. The
+        /// entry refreshes itself until [`clear_presence`](Self::clear_presence)
+        /// or the tab closes, after which peers expire it.
+        #[wasm_bindgen(js_name = setPresence)]
+        pub fn set_presence(&self, fields: JsValue) {
+            let map: HashMap<String, LoroValue> = crate::comments::fields_from_js(&fields)
+                .into_iter()
+                .collect();
+            let value = LoroValue::from(map);
+            *self.my_presence.borrow_mut() = Some(value.clone());
+            self.presence.set(&self.node_id(), value);
+        }
+
+        /// Drop this peer's presence entry.
+        #[wasm_bindgen(js_name = clearPresence)]
+        pub fn clear_presence(&self) {
+            *self.my_presence.borrow_mut() = None;
+            self.presence.delete(&self.node_id());
+        }
+
+        /// Every live presence entry, keyed by peer node id, own entry included.
+        pub fn presence(&self) -> JsValue {
+            presence_to_js(&self.presence)
+        }
+
         /// Register `onLog(message: string)`.
         #[wasm_bindgen(js_name = onLog)]
         pub fn on_log(&self, callback: Function) {
@@ -387,6 +473,13 @@ mod client {
         #[wasm_bindgen(js_name = onPeerIdentity)]
         pub fn on_peer_identity(&self, callback: Function) {
             *self.callbacks.on_peer_identity.borrow_mut() = Some(callback);
+        }
+
+        /// Register `onPresence(peers: object)`, fired with every live entry
+        /// (as [`presence`](Self::presence) returns) on each change.
+        #[wasm_bindgen(js_name = onPresence)]
+        pub fn on_presence(&self, callback: Function) {
+            *self.callbacks.on_presence.borrow_mut() = Some(callback);
         }
 
         /// Register `onDisconnect(reason: string)`.
@@ -421,6 +514,66 @@ mod client {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// On every store event, fire the presence callback with a fresh snapshot.
+    async fn reflect_presence(
+        presence: Presence,
+        mut events: mpsc::UnboundedReceiver<()>,
+        callbacks: Rc<Callbacks>,
+    ) {
+        while events.recv().await.is_some() {
+            callbacks.presence(&presence_to_js(&presence));
+        }
+    }
+
+    /// Re-set the own entry and sweep expired peers, forever. The re-set is
+    /// the keepalive: it bumps the entry's timestamp and streams to the host.
+    async fn refresh_presence(
+        presence: Presence,
+        key: String,
+        mine: Rc<RefCell<Option<LoroValue>>>,
+    ) {
+        loop {
+            sleep_ms(PRESENCE_REFRESH_MS).await;
+            let value = mine.borrow().clone();
+            if let Some(value) = value {
+                presence.set(&key, value);
+            }
+            presence.remove_outdated();
+        }
+    }
+
+    /// The store as a JS object: entry keys to objects of scalar fields.
+    fn presence_to_js(presence: &Presence) -> JsValue {
+        let out = Object::new();
+        for (key, value) in presence.all() {
+            let entry: JsValue = match &value {
+                LoroValue::Map(fields) => {
+                    let obj = Object::new();
+                    for (k, v) in fields.iter() {
+                        let _ = Reflect::set(
+                            &obj,
+                            &JsValue::from_str(k),
+                            &crate::comments::value_to_js(v),
+                        );
+                    }
+                    obj.into()
+                }
+                v => crate::comments::value_to_js(v),
+            };
+            let _ = Reflect::set(&out, &JsValue::from_str(&key), &entry);
+        }
+        out.into()
+    }
+
+    async fn sleep_ms(ms: i32) {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let _ = web_sys::window()
+                .expect("browser window")
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     /// On every `changed` tick, re-read the doc and fire the file list plus each
