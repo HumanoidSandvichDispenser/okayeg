@@ -15,8 +15,8 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use okayeg::{Doc, LoroValue, NodeKind, Presence};
 use okayeg_net::{
-    Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity, Node, Perms,
-    PresenceLink, Shared, Transport, drive_live, hello,
+    Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Node, Perms, PresenceLink,
+    Shared, Transport, drive_live,
 };
 use tokio::sync::broadcast;
 
@@ -35,11 +35,17 @@ const KEY_PATH: &str = ".eg/key";
 // kept across runs so node ids stay stable; rebuilding from files each run duplicates them on merge
 const DOC_PATH: &str = ".eg/doc";
 
-/// How long to wait for a peer's hello before dropping the connection.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long a presence entry lives without a refresh.
 const PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A peer's self-asserted name and email, read from its presence entry.
+/// Display only, like a git commit author.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Identity {
+    name: Option<String>,
+
+    email: Option<String>,
+}
 
 /// Wire this node's presence: set its own entry under `key`, feed local
 /// updates into the relay, and keep the entry fresh while sweeping expired
@@ -90,9 +96,9 @@ fn presence_value(identity: &Identity) -> LoroValue {
     LoroValue::from(map)
 }
 
-/// The identity announced in this repo's hellos: `[identity]` from the config,
-/// falling back per field to git config for anything unset. An empty string in
-/// the config keeps the field blank.
+/// The identity announced in this repo's presence entry: `[identity]` from the
+/// config, falling back per field to git config for anything unset. An empty
+/// string in the config keeps the field blank.
 fn local_identity(config: &Config, dir: &Path) -> Identity {
     let field = |set: &Option<String>, key: &str| match set {
         Some(s) => (!s.is_empty()).then(|| s.clone()),
@@ -145,19 +151,10 @@ fn label(identity: &Identity, who: &EndpointId) -> String {
 
 /// Report a session event to the `[session] command` hook, when one is
 /// configured. Fire and forget: the hook decides nothing, a failure only logs.
-fn run_session_hook(
-    cmd: &Rc<Option<Vec<String>>>,
-    event: &str,
-    who: &EndpointId,
-    identity: &Identity,
-) {
+fn run_session_hook(cmd: &Rc<Option<Vec<String>>>, event: &str, who: &EndpointId) {
     let Some(cmd) = cmd.as_ref() else { return };
 
-    let stdin_body = format!(
-        "{event}\n{who}\n{}\n{}\n",
-        identity.name.as_deref().unwrap_or(""),
-        identity.email.as_deref().unwrap_or("")
-    );
+    let stdin_body = format!("{event}\n{who}\n");
     let child = tokio::process::Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdin(std::process::Stdio::piped())
@@ -180,19 +177,19 @@ fn run_session_hook(
     });
 }
 
-/// Exchange hellos on a fresh stream, bounded by [`HELLO_TIMEOUT`].
-async fn exchange_hello<W, R>(
-    send: &mut W,
-    recv: &mut R,
-    mine: &Identity,
-) -> Result<Identity, okayeg_net::Error>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-    R: tokio::io::AsyncRead + Unpin,
-{
-    match tokio::time::timeout(HELLO_TIMEOUT, hello(send, recv, mine)).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(okayeg_net::Error::Transport("hello timed out".into())),
+/// The identity a peer claims in its presence entry, empty when none arrived.
+fn presence_identity(presence: &Presence, who: &EndpointId) -> Identity {
+    let Some(LoroValue::Map(fields)) = presence.get(&who.to_string()) else {
+        return Identity::default();
+    };
+    let text = |key: &str| match fields.get(key) {
+        Some(LoroValue::String(s)) => Some(s.to_string()),
+        _ => None,
+    };
+
+    Identity {
+        name: text("name"),
+        email: text("email"),
     }
 }
 
@@ -332,64 +329,50 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         };
 
         let sessions: Sessions = Rc::new(RefCell::new(Vec::new()));
-        spawn_repl(sessions.clone(), base, session_hook.clone());
+        spawn_repl(
+            sessions.clone(),
+            presence.clone(),
+            base,
+            session_hook.clone(),
+        );
 
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
                 Accepted::Peer {
                     who,
                     perms,
-                    mut send,
-                    mut recv,
+                    send,
+                    recv,
                     guard,
                 } => {
                     let doc = doc.clone();
                     let changed = changed.clone();
-                    let me = me.clone();
                     let hook = session_hook.clone();
-                    let identity = Rc::new(RefCell::new(Identity::default()));
                     let link = PresenceLink {
                         presence: presence.clone(),
                         relay: relay.clone(),
                         owner: Some(who.to_string()),
                     };
 
-                    // the hello wait lives in the session task, so a peer that
-                    // opens a stream and goes silent stalls only itself
-                    let session_identity = identity.clone();
+                    // the claimed name arrives through presence a moment after
+                    // the session opens, so the join line carries the bare id;
+                    // the sessions command shows the name once it lands
+                    println!("eg serve: {who} joined ({})", trust::flags(perms));
+                    run_session_hook(&hook, "hello", &who);
+
                     let handle = tokio::task::spawn_local(async move {
                         let _guard = guard; // hold the link open for the session
-                        let peer = match exchange_hello(&mut send, &mut recv, &me).await {
-                            Ok(peer) => peer,
-                            Err(e) => {
-                                eprintln!("eg serve: {who} dropped during hello: {e}");
-                                return;
-                            }
-                        };
-                        println!(
-                            "eg serve: {} joined ({})",
-                            label(&peer, &who),
-                            trust::flags(perms)
-                        );
-                        run_session_hook(&hook, "hello", &who, &peer);
-                        *session_identity.borrow_mut() = peer;
-
                         if let Err(e) =
                             drive_live(doc, send, recv, perms, changed, Some(link)).await
                         {
                             eprintln!("eg serve: {who} dropped: {e}");
                         }
-                        run_session_hook(&hook, "bye", &who, &Identity::default());
+                        run_session_hook(&hook, "bye", &who);
                     });
 
                     let mut sessions = sessions.borrow_mut();
                     sessions.retain(|s| !s.handle.is_finished());
-                    sessions.push(Session {
-                        who,
-                        perms,
-                        identity,
-                        handle,
-                    });
+                    sessions.push(Session { who, perms, handle });
                 }
                 Accepted::Refused { who, message } => match message {
                     Some(msg) => println!("eg serve: refused {who}: {msg}"),
@@ -407,9 +390,6 @@ struct Session {
     who: EndpointId,
 
     perms: Perms,
-
-    /// The peer's claimed identity, filled in once its hello arrives.
-    identity: Rc<RefCell<Identity>>,
 
     handle: tokio::task::JoinHandle<()>,
 }
@@ -446,7 +426,7 @@ enum ReplCmd {
 ///
 /// EOF on stdin ends the repl and serving continues, so `eg serve < /dev/null`
 /// still works headless.
-fn spawn_repl(sessions: Sessions, dir: PathBuf, hook: Rc<Option<Vec<String>>>) {
+fn spawn_repl(sessions: Sessions, presence: Presence, dir: PathBuf, hook: Rc<Option<Vec<String>>>) {
     tokio::task::spawn_local(async move {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -455,14 +435,20 @@ fn spawn_repl(sessions: Sessions, dir: PathBuf, hook: Rc<Option<Vec<String>>>) {
                 continue;
             }
             match <ReplCmd as clap::Parser>::try_parse_from(line.split_whitespace()) {
-                Ok(cmd) => run_repl_cmd(cmd, &sessions, &dir, &hook),
+                Ok(cmd) => run_repl_cmd(cmd, &sessions, &presence, &dir, &hook),
                 Err(e) => print!("{e}"), // clap's own usage/help text
             }
         }
     });
 }
 
-fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path, hook: &Rc<Option<Vec<String>>>) {
+fn run_repl_cmd(
+    cmd: ReplCmd,
+    sessions: &Sessions,
+    presence: &Presence,
+    dir: &Path,
+    hook: &Rc<Option<Vec<String>>>,
+) {
     match cmd {
         ReplCmd::Sessions => {
             let mut sessions = sessions.borrow_mut();
@@ -471,7 +457,7 @@ fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path, hook: &Rc<Option<
             for s in sessions.iter() {
                 println!(
                     "  {} {}",
-                    label(&s.identity.borrow(), &s.who),
+                    label(&presence_identity(presence, &s.who), &s.who),
                     trust::flags(s.perms)
                 );
             }
@@ -483,7 +469,7 @@ fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path, hook: &Rc<Option<
                 if s.who == id && !s.handle.is_finished() {
                     s.handle.abort();
                     // an aborted session task never reaches its own bye
-                    run_session_hook(hook, "bye", &s.who, &Identity::default());
+                    run_session_hook(hook, "bye", &s.who);
                     dropped += 1;
                 }
                 s.who != id
@@ -552,15 +538,7 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
 
         println!("eg join: syncing live with {id} (ctrl-c to stop)");
 
-        let (mut send, mut recv, _guard) = node.dial(id).await.map_err(to_io)?;
-        let host = match exchange_hello(&mut send, &mut recv, &me).await {
-            Ok(host) => host,
-            Err(e) => return Err(report_sync_error("eg join", &id, e)),
-        };
-        if !host.is_empty() {
-            println!("eg join: host is {}", label(&host, &id));
-        }
-
+        let (send, recv, _guard) = node.dial(id).await.map_err(to_io)?;
         let link = PresenceLink {
             presence,
             relay,
@@ -585,21 +563,18 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
         let node = Node::bind_with_secret(repo_secret(&ws)?)
             .await
             .map_err(to_io)?;
-        let me = local_identity(&Config::load(&ws)?, dir);
 
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
-        let host = match node
-            .sync_with(id, &doc, &me, Duration::from_secs(timeout_secs))
+        if let Err(e) = node
+            .sync_with(id, &doc, Duration::from_secs(timeout_secs))
             .await
         {
-            Ok(host) => host,
-            Err(e) => return Err(report_sync_error("eg pull", &id, e)),
-        };
+            return Err(report_sync_error("eg pull", &id, e));
+        }
 
         let files = store(&doc, &ws)?.len();
         println!(
-            "eg pull: synced with {}, wrote {files} file(s) to {}",
-            label(&host, &id),
+            "eg pull: synced with {id}, wrote {files} file(s) to {}",
             dir.display()
         );
         Ok(())

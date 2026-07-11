@@ -15,12 +15,7 @@ async fn dial_to_unknown_peer_times_out() {
 
     let started = Instant::now();
     let result = node
-        .sync_with(
-            unreachable,
-            &doc,
-            &Default::default(),
-            Duration::from_millis(500),
-        )
+        .sync_with(unreachable, &doc, Duration::from_millis(500))
         .await;
     let elapsed = started.elapsed();
 

@@ -32,7 +32,7 @@ mod client {
     use iroh::{Endpoint, EndpointId, SecretKey};
     use js_sys::{Array, Function, Object, Reflect};
     use okayeg::{Doc, FileTree, LoroValue, NodeKind, Presence, Subscription, TreeID};
-    use okayeg_net::{ALPN, Identity, Perms, PresenceLink, Shared, drive_live, hello};
+    use okayeg_net::{ALPN, Perms, PresenceLink, Shared, drive_live};
     use tokio::sync::{broadcast, mpsc};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
@@ -53,7 +53,6 @@ mod client {
         on_files: RefCell<Option<Function>>,
         on_file_content: RefCell<Option<Function>>,
         on_comments: RefCell<Option<Function>>,
-        on_peer_identity: RefCell<Option<Function>>,
         on_presence: RefCell<Option<Function>>,
         on_disconnect: RefCell<Option<Function>>,
     }
@@ -88,15 +87,6 @@ mod client {
             }
         }
 
-        fn peer_identity(&self, identity: &Identity) {
-            if let Some(f) = self.on_peer_identity.borrow().as_ref() {
-                let js = |s: &Option<String>| {
-                    s.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL)
-                };
-                let _ = f.call2(&JsValue::NULL, &js(&identity.name), &js(&identity.email));
-            }
-        }
-
         fn presence(&self, peers: &JsValue) {
             if let Some(f) = self.on_presence.borrow().as_ref() {
                 let _ = f.call1(&JsValue::NULL, peers);
@@ -117,7 +107,6 @@ mod client {
         changed: broadcast::Sender<()>,
         secret: SecretKey,
         endpoint: Rc<RefCell<Option<Endpoint>>>,
-        identity: RefCell<Identity>,
         callbacks: Rc<Callbacks>,
         presence: Presence,
         relay: broadcast::Sender<(String, Vec<u8>)>,
@@ -214,23 +203,12 @@ mod client {
                 changed,
                 secret,
                 endpoint: Rc::new(RefCell::new(None)),
-                identity: RefCell::new(Identity::default()),
                 callbacks,
                 presence,
                 relay,
                 my_presence,
                 _presence_subs: (local_sub, events_sub),
             }
-        }
-
-        /// Set the name and email announced to peers on connect. Display only;
-        /// it grants nothing.
-        #[wasm_bindgen(js_name = setIdentity)]
-        pub fn set_identity(&self, name: Option<String>, email: Option<String>) {
-            *self.identity.borrow_mut() = Identity {
-                name: name.filter(|s| !s.is_empty()),
-                email: email.filter(|s| !s.is_empty()),
-            };
         }
 
         /// This peer's node id (hex `EndpointId`), the identity a host authorizes.
@@ -250,16 +228,10 @@ mod client {
                 .connect(peer, ALPN)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("connect: {e}")))?;
-            let (mut send, mut recv) = conn
+            let (send, recv) = conn
                 .open_bi()
                 .await
                 .map_err(|e| JsValue::from_str(&format!("open_bi: {e}")))?;
-
-            let mine = self.identity.borrow().clone();
-            let host = hello(&mut send, &mut recv, &mine)
-                .await
-                .map_err(|e| JsValue::from_str(&format!("hello: {e}")))?;
-            self.callbacks.peer_identity(&host);
 
             self.callbacks.log(&format!("connected to {peer}"));
 
@@ -466,13 +438,6 @@ mod client {
         #[wasm_bindgen(js_name = onComments)]
         pub fn on_comments(&self, callback: Function) {
             *self.callbacks.on_comments.borrow_mut() = Some(callback);
-        }
-
-        /// Register `onPeerIdentity(name: string|null, email: string|null)`,
-        /// fired with the host's claimed identity once its hello arrives.
-        #[wasm_bindgen(js_name = onPeerIdentity)]
-        pub fn on_peer_identity(&self, callback: Function) {
-            *self.callbacks.on_peer_identity.borrow_mut() = Some(callback);
         }
 
         /// Register `onPresence(peers: object)`, fired with every live entry

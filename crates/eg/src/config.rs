@@ -20,9 +20,10 @@
 //! email = "alice@example.com"
 //! ```
 //!
-//! `identity` is the name and email announced to peers, like `git config
-//! user.name`. Self-asserted; it grants nothing. A key that is absent falls
-//! back to the same key in git config; a key set to `""` stays blank instead.
+//! `identity` is the name and email shared with peers in this repo's presence
+//! entry, like `git config user.name`. Self-asserted; it grants nothing. A key
+//! that is absent falls back to the same key in git config; a key set to `""`
+//! stays blank instead.
 //!
 //! ```toml
 //! [session]
@@ -30,9 +31,8 @@
 //! ```
 //!
 //! `session.command` names a program run once per session event on a serving
-//! repo. Its stdin is four newline-terminated lines: the event (`hello` at
-//! join, `bye` at leave), the peer's endpoint id, then its claimed name and
-//! email (blank when unset, and always blank for `bye`). It decides nothing:
+//! repo. Its stdin is two newline-terminated lines: the event (`hello` at
+//! join, `bye` at leave), then the peer's endpoint id. It decides nothing:
 //! its exit status is ignored and a failure only logs.
 
 use std::io;

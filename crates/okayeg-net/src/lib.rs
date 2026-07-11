@@ -110,93 +110,15 @@ pub const ALPN: &[u8] = b"okayeg/sync/0";
 /// Largest frame we will read to not allow a peer to make us allocate more than this much at once.
 const MAX_FRAME: usize = 64 << 20;
 
-/// First byte of a control frame. A sync [`Msg`] tags itself 0 or 1, so `0xFF`
-/// never clashes with one, and the dialer can tell a refusal from a sync reply.
+/// First byte of a control frame. A sync [`Msg`] tags itself 0, 1, or 2, so
+/// `0xFF` never clashes with one, and the dialer can tell a refusal from a
+/// sync reply.
 const CTRL_TAG: u8 = 0xFF;
 /// Control-frame kind: the peer refused the connection.
 const CTRL_REFUSED: u8 = 0;
-/// Control-frame kind: the peer's claimed identity, sent as the first frame.
-const CTRL_HELLO: u8 = 1;
-/// Cap on peer-chosen strings (refusal message, identity fields), so a peer
-/// can't make us frame a huge string.
+/// Cap on the peer-chosen refusal message, so a peer can't make us frame a
+/// huge string.
 const MAX_MESSAGE: usize = 512;
-
-/// A peer's self-asserted name and email, exchanged in the [`hello`] frame.
-/// Display only, like a git commit author.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Identity {
-    pub name: Option<String>,
-
-    pub email: Option<String>,
-}
-
-impl Identity {
-    /// Whether neither field is set.
-    pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.email.is_none()
-    }
-}
-
-/// Frame a hello: control tag, kind, then each field as a two byte big endian
-/// length and its bytes. A zero length means the field is unset.
-fn encode_hello(identity: &Identity) -> Vec<u8> {
-    fn put(out: &mut Vec<u8>, field: Option<&str>) {
-        let bytes = field.unwrap_or("").as_bytes();
-        let bytes = &bytes[..bytes.len().min(MAX_MESSAGE)];
-        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        out.extend_from_slice(bytes);
-    }
-
-    let mut out = vec![CTRL_TAG, CTRL_HELLO];
-    put(&mut out, identity.name.as_deref());
-    put(&mut out, identity.email.as_deref());
-    out
-}
-
-/// Decode a hello body (after the tag and kind bytes), or `None` when malformed.
-fn decode_hello(mut body: &[u8]) -> Option<Identity> {
-    fn take(body: &mut &[u8]) -> Option<Option<String>> {
-        let (len, rest) = body.split_first_chunk::<2>()?;
-        let len = u16::from_be_bytes(*len) as usize;
-        if rest.len() < len {
-            return None;
-        }
-
-        let (field, rest) = rest.split_at(len);
-        *body = rest;
-        Some((!field.is_empty()).then(|| String::from_utf8_lossy(field).into_owned()))
-    }
-
-    let name = take(&mut body)?;
-    let email = take(&mut body)?;
-    Some(Identity { name, email })
-}
-
-/// Exchange hello frames with a peer: announce `mine`, read back its claimed
-/// [`Identity`]. The hello is the first frame in each direction.
-///
-/// A refusal read in place of the hello surfaces as [`Error::Refused`].
-pub async fn hello<W, R>(send: &mut W, recv: &mut R, mine: &Identity) -> Result<Identity, Error>
-where
-    W: AsyncWrite + Unpin,
-    R: AsyncRead + Unpin,
-{
-    write_frame(send, &encode_hello(mine)).await?;
-    send.flush().await?;
-
-    let frame = read_frame(recv).await?;
-    match frame.split_first() {
-        Some((&CTRL_TAG, rest)) => match rest.split_first() {
-            Some((&CTRL_HELLO, body)) => {
-                decode_hello(body).ok_or_else(|| Error::Transport("malformed hello".into()))
-            }
-            _ => Err(decode_frame(&frame).err().unwrap_or_else(|| {
-                Error::Transport("unexpected control frame in place of hello".into())
-            })),
-        },
-        _ => Err(Error::Transport("peer sent sync before hello".into())),
-    }
-}
 
 /// Frame a refusal: control tag, kind, then the message bytes.
 fn encode_refused(message: Option<&str>) -> Vec<u8> {
@@ -541,74 +463,6 @@ mod tests {
         // A real sync frame is untouched: its tag can never be the control tag.
         let have = Msg::Have(vec![1, 2, 3]).encode();
         assert!(matches!(decode_frame(&have), Ok(Msg::Have(_))));
-    }
-
-    #[test]
-    fn hello_frame_round_trips() {
-        let full = Identity {
-            name: Some("alice".into()),
-            email: Some("alice@example.com".into()),
-        };
-        let frame = encode_hello(&full);
-        assert_eq!(decode_hello(&frame[2..]), Some(full));
-
-        // Unset and blank fields both decode to None.
-        let frame = encode_hello(&Identity::default());
-        assert_eq!(decode_hello(&frame[2..]), Some(Identity::default()));
-
-        // A field longer than the cap is truncated, not an error.
-        let long = Identity {
-            name: Some("x".repeat(MAX_MESSAGE + 100)),
-            email: None,
-        };
-        let frame = encode_hello(&long);
-        let decoded = decode_hello(&frame[2..]).unwrap();
-        assert_eq!(decoded.name.unwrap().len(), MAX_MESSAGE);
-
-        // Truncated bodies are malformed, not a panic.
-        assert_eq!(decode_hello(&frame[2..5]), None);
-    }
-
-    #[tokio::test]
-    async fn hello_exchanges_identities_both_ways() {
-        let (a, b) = tokio::io::duplex(4096);
-        let (mut a_recv, mut a_send) = tokio::io::split(a);
-        let (mut b_recv, mut b_send) = tokio::io::split(b);
-
-        let alice = Identity {
-            name: Some("alice".into()),
-            email: None,
-        };
-        let bob = Identity {
-            name: Some("bob".into()),
-            email: Some("bob@example.com".into()),
-        };
-
-        let (a_got, b_got) = tokio::join!(
-            hello(&mut a_send, &mut a_recv, &alice),
-            hello(&mut b_send, &mut b_recv, &bob),
-        );
-        assert_eq!(a_got.unwrap(), bob);
-        assert_eq!(b_got.unwrap(), alice);
-    }
-
-    #[tokio::test]
-    async fn hello_surfaces_a_refusal() {
-        let (client, server) = tokio::io::duplex(4096);
-        let (mut client_recv, mut client_send) = tokio::io::split(client);
-        let (_server_recv, mut server_send) = tokio::io::split(server);
-
-        write_frame(&mut server_send, &encode_refused(Some("not trusted")))
-            .await
-            .unwrap();
-
-        let err = hello(&mut client_send, &mut client_recv, &Identity::default())
-            .await
-            .unwrap_err();
-        match err {
-            Error::Refused { message } => assert_eq!(message.as_deref(), Some("not trusted")),
-            other => panic!("expected Refused, got {other:?}"),
-        }
     }
 
     #[tokio::test]
