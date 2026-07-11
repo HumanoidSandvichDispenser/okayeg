@@ -27,10 +27,7 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// short so a slow dialer can't stall the accept loop.
 const REFUSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Generate a fresh 32-byte secret, the raw form of a node's identity.
-///
-/// The caller persists these bytes (we keep crypto here and storage out of this crate) and feeds
-/// them back to [`Node::bind_with_secret`] to keep a stable identity across restarts.
+/// Generate a fresh 32-byte secret.
 pub fn generate_secret() -> [u8; 32] {
     SecretKey::generate().to_bytes()
 }

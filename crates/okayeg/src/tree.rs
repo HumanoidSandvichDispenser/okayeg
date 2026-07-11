@@ -50,9 +50,8 @@ impl Doc {
 
 /// A view over the file tree held in a [`Doc`].
 ///
-/// Cheap to construct; it borrows the doc and reads or writes the tree
-/// container on each call. Edits apply to the local copy and are folded into
-/// history at the doc's next [`commit`](Doc::commit).
+/// Reads or writes the tree container on each call. Edits apply to the local
+/// copy and write into history at the doc's next [`commit`](Doc::commit).
 pub struct FileTree<'a> {
     doc: &'a Doc,
 }
@@ -157,7 +156,7 @@ impl FileTree<'_> {
     ///
     /// Loro diffs the new text against the current content and records only the
     /// real change, so writing back identical text is a no-op. Returns `false`
-    /// if the node is not a file. This is how the filesystem bridge folds an
+    /// if the node is not a file. This is how the filesystem bridge merges an
     /// edited file in without echoing its own writes back out.
     pub fn set_content(&self, node: TreeID, text: &str) -> bool {
         match self.content(node) {
@@ -184,7 +183,8 @@ impl FileTree<'_> {
     /// through an import, so Loro reconciles it with concurrent ops by CRDT
     /// causality rather than by byte positions. Returns `false` when the edit
     /// cannot be expressed at `base` (the node was not a file there, or `base`
-    /// is not in this doc's history); the caller decides how to fall back.
+    /// is not in this doc's history). This method does not decide how to fall
+    /// back should the edit fail.
     pub fn set_content_at(&self, node: TreeID, text: &str, base: &Frontiers) -> bool {
         let doc = self.doc.inner();
         let Ok(fork) = doc.fork_at(base) else {
@@ -205,6 +205,7 @@ impl FileTree<'_> {
         if content.update(text, UpdateOptions::default()).is_err() {
             return false;
         }
+
         fork.commit();
 
         let Ok(updates) = fork.export(ExportMode::updates(&doc.state_vv())) else {

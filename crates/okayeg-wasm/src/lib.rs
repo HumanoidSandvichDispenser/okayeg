@@ -397,8 +397,10 @@ mod client {
             match changed.recv().await {
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     let files = collect_files(&doc);
+
                     let paths: Vec<String> = files.iter().map(|(p, _, _)| p.clone()).collect();
                     callbacks.files(&paths);
+
                     let nodes: Vec<(String, TreeID)> = files
                         .iter()
                         .map(|(p, n, _)| (p.clone(), *n))
@@ -406,6 +408,7 @@ mod client {
                     for (path, _, content) in files {
                         callbacks.file_content(&path, &content);
                     }
+
                     callbacks.comments(&crate::comments::to_js(&doc, &nodes));
                 }
                 // The client (and its sender) was dropped; nothing more to do.

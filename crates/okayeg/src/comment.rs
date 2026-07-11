@@ -28,9 +28,8 @@ impl Doc {
 
 /// A view over the comments held in a [`Doc`].
 ///
-/// Cheap to construct; it borrows the doc and reads or writes the comments
-/// container on each call. Edits apply to the local copy and are folded into
-/// history at the doc's next [`commit`](Doc::commit).
+/// Reads or writes the comments container on each call. Edits apply to the
+/// local copy and write into history at the doc's next [`commit`](Doc::commit).
 pub struct Comments<'a> {
     doc: &'a Doc,
 }
@@ -73,13 +72,13 @@ impl Comments<'_> {
         format!("{:016x}-{n}", self.doc.peer_id())
     }
 
-    /// Anchor a new comment to `range` in `file`'s content, with `created_at`
-    /// in milliseconds since epoch and any consumer fields to set alongside.
+    /// Anchor a new comment to `range` in `file`'s content, with `created_at` in
+    /// milliseconds since epoch and any consumer fields set alongside.
     ///
-    /// The range is in unicode codepoints, end exclusive; the start anchors to
-    /// the left and the end to the right, so text typed inside the span grows
-    /// it. Returns the new comment's id, or `None` when `file` is not a file
-    /// node or the range does not fit its content.
+    /// The range is in unicode codepoints, end exclusive; the start anchors left
+    /// and the end right, so text typed inside the span grows it. Returns the new
+    /// comment's id, or `None` when `file` is not a file node or the range does not
+    /// fit its content.
     pub fn add<K: AsRef<str>>(
         &self,
         file: TreeID,
@@ -99,6 +98,7 @@ impl Comments<'_> {
             .map()
             .insert_container(&id, LoroMap::new())
             .expect("insert comment map");
+
         comment
             .insert("file", file.to_string())
             .expect("insert file");
@@ -114,6 +114,7 @@ impl Comments<'_> {
                 .insert(key.as_ref(), value.clone())
                 .expect("insert field");
         }
+
         Some(id)
     }
 
@@ -129,11 +130,13 @@ impl Comments<'_> {
         fields: &[(K, LoroValue)],
     ) -> Option<String> {
         self.comment(parent)?;
+
         let id = self.next_id();
         let comment = self
             .map()
             .insert_container(&id, LoroMap::new())
             .expect("insert comment map");
+
         comment.insert("parent", parent).expect("insert parent");
         comment
             .insert("created_at", created_at)
@@ -143,6 +146,7 @@ impl Comments<'_> {
                 .insert(key.as_ref(), value.clone())
                 .expect("insert field");
         }
+
         Some(id)
     }
 
@@ -203,6 +207,7 @@ impl Comments<'_> {
             .get("created_at")
             .and_then(|v| v.as_value()?.as_i64().copied())
             .unwrap_or(0);
+
         let mut fields = Vec::new();
         for key in comment.keys() {
             if RESERVED.contains(&key.as_ref()) {
@@ -212,6 +217,7 @@ impl Comments<'_> {
                 fields.push((key.to_string(), value));
             }
         }
+
         Comment {
             id: id.to_string(),
             file,

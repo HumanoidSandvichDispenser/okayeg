@@ -316,11 +316,14 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
         let doc: Shared = Rc::new(open_or_clone(&*ws)?);
         let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
+
         println!("eg join: syncing live with {id} (ctrl-c to stop)");
+
         let (send, recv, _guard) = node.dial(id).await.map_err(to_io)?;
         if let Err(e) = drive_live(doc, send, recv, Perms::all(), changed).await {
             return Err(report_sync_error("eg join", &id, e));
         }
+
         println!("eg join: link closed");
         Ok(())
     })
@@ -334,10 +337,12 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
+
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
         if let Err(e) = node.sync_with(id, &doc, Duration::from_secs(timeout_secs)).await {
             return Err(report_sync_error("eg pull", &id, e));
         }
+
         let files = store(&doc, &ws)?.len();
         println!(
             "eg pull: synced with {id}, wrote {files} file(s) to {}",
@@ -373,7 +378,7 @@ fn sanitize(s: &str) -> String {
 }
 
 /// Wire the FS watcher and disk exporter onto the shared doc, returning the
-/// repo-wide change nudge. The watcher folds local edits in (firing the nudge
+/// repo-wide change nudge. The watcher merges local edits in (firing the nudge
 /// when they move the doc); the exporter writes the doc back out on every nudge,
 /// whatever its source.
 ///
@@ -402,7 +407,7 @@ fn spawn_watch_and_export(
         .watch(&base, RecursiveMode::Recursive)
         .map_err(to_io)?;
 
-    // ingest: fold each changed path in, nudge only when the doc actually moves.
+    // ingest: merge each changed path in, nudge only when the doc actually moves.
     let in_ws = ws.clone();
     let in_doc = doc.clone();
     let in_changed = changed.clone();

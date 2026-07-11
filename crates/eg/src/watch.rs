@@ -1,4 +1,4 @@
-//! Live syncing: watch a directory and fold its changes into a doc.
+//! Live syncing: watch a directory and merge its changes into a doc.
 //!
 //! On each debounced batch the watcher does a *scoped* reconcile: for each path
 //! that changed, it asks the filesystem what is there now and makes the doc
@@ -70,7 +70,7 @@ pub fn seed_bases(ws: &dyn Workspace, doc: &Doc) -> FileBases {
     bases
 }
 
-/// Fold a batch of changed paths into the doc, commit, and advance each path's
+/// Merge a batch of changed paths into the doc, commit, and advance each path's
 /// merge base to the resulting frontier. Returns whether the doc moved.
 pub fn apply_batch(
     ws: &dyn Workspace,

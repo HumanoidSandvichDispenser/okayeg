@@ -12,9 +12,7 @@ use loro::{LoroError, VersionVector};
 
 use crate::Doc;
 
-/// A protocol message. The caller frames these on the wire (one per websocket
-/// message, length-prefixed over a stream, and so on); the protocol only cares
-/// about message boundaries, not how they are drawn.
+/// A protocol message.
 pub enum Msg {
     /// "Here is the version I have." Carries an encoded [`VersionVector`].
     Have(Vec<u8>),
@@ -46,16 +44,10 @@ impl Msg {
     }
 }
 
-/// What a peer is allowed to do in a sync, mapped onto the two directions of
-/// the exchange.
-///
-/// `pull` lets them read our state: we answer their version with the real
-/// updates they lack. `push` lets them write to us: we import the updates they
-/// send. Denying a direction does not change the message shape, it withholds
-/// content, so a read-only peer still gets a (empty) reply and a peer we will
-/// not accept writes from still has its updates read off the wire and dropped.
-/// A peer allowed neither should never reach the protocol; that admission check
-/// belongs to the caller, not here.
+/// What a peer may do in a sync, per direction: `pull` reads our state, `push`
+/// writes to ours. Denying a direction withholds content without changing the
+/// message shape (a read-only peer still gets an empty reply, and a no-push
+/// peer's updates are dropped).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Perms {
     /// May read our state.
@@ -65,8 +57,7 @@ pub struct Perms {
 }
 
 impl Perms {
-    /// Full access: a symmetric, ungated sync. What a dialer and in-process use
-    /// get, and what both sides of a mutual-trust sync grant.
+    /// Full, symmetric access.
     pub const fn all() -> Self {
         Self {
             pull: true,

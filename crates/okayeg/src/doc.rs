@@ -28,15 +28,14 @@ impl Doc {
         })
     }
 
-    /// The text container with the given name, created on first access.
-    ///
-    /// Content edits go through the returned handle; they apply to this copy
-    /// immediately and are folded into history at the next [`commit`](Self::commit).
+    /// The text container with the given name, created on first access. Edits
+    /// through the returned handle apply immediately and write into history at the
+    /// next [`commit`](Self::commit).
     pub fn text(&self, name: &str) -> LoroText {
         self.inner.get_text(name)
     }
 
-    /// Fold pending edits into the doc's history.
+    /// Write pending edits into the doc's history.
     ///
     /// Edits made through a container handle are buffered until committed;
     /// exporting or taking a version reflects only committed history.
@@ -50,8 +49,6 @@ impl Doc {
     }
 
     /// The doc's current frontiers, the tips of its history.
-    ///
-    /// A checkpoint pins a doc to a frontier, so this is what gets recorded.
     pub fn frontiers(&self) -> Frontiers {
         self.inner.state_frontiers()
     }
@@ -68,22 +65,17 @@ impl Doc {
             .map_err(Into::into)
     }
 
-    /// The updates this doc has that the given version does not.
-    ///
-    /// This is the answer to a peer's "here is the version I have, send me
-    /// what I'm missing." An empty `since` yields the doc's whole history.
+    /// The updates this doc has that the given version does not. An empty `since`
+    /// yields the doc's whole history.
     pub fn updates_since(&self, since: &VersionVector) -> Result<Vec<u8>, LoroError> {
         self.inner
             .export(ExportMode::updates(since))
             .map_err(Into::into)
     }
 
-    /// Apply updates received from a peer.
-    ///
-    /// The returned [`ImportStatus`] reports what applied and what is held
-    /// pending. Updates whose ancestors are missing land in `pending` rather
-    /// than applying partially, so the caller can tell "references history I
-    /// don't have" from a clean apply.
+    /// Apply updates received from a peer. The returned [`ImportStatus`] reports
+    /// what applied and what is held pending; updates whose ancestors are missing
+    /// land in `pending` rather than applying partially.
     pub fn import(&self, bytes: &[u8]) -> Result<ImportStatus, LoroError> {
         self.inner.import(bytes)
     }

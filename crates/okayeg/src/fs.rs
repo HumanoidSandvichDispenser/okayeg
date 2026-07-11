@@ -97,10 +97,9 @@ impl Doc {
 
 /// A path-addressed view over a [`Doc`]'s file tree.
 ///
-/// Cheap to construct; it borrows the doc and resolves paths against the tree
-/// on each call. When sibling names collide (concurrent creates merge that
-/// way), a path resolves to the first match in child order; the duplicates
-/// stay reachable by node through [`FileTree`].
+/// Resolves paths against the tree on each call. If sibling names collide, a
+/// path resolves to the first match in child order. Duplicates would stay
+/// reachable by node through [`FileTree`].
 pub struct DocFs<'a> {
     doc: &'a Doc,
 }
@@ -393,7 +392,7 @@ impl DocFs<'_> {
             }
 
             // Creation also fires metadata and content diffs for the new
-            // node; fold those into the one Created.
+            // node; merge those into the one Created.
             let created: Vec<TreeID> = changes
                 .iter()
                 .filter_map(|c| match c {
@@ -555,7 +554,7 @@ mod tests {
             sink.lock().unwrap().extend_from_slice(changes);
         });
 
-        // A creation folds its metadata and content writes into one Created.
+        // A creation merges its metadata and content writes into one Created.
         let node = doc.fs().create_file("notes.txt").unwrap();
         doc.fs().text("notes.txt").unwrap().insert(0, "hi").unwrap();
         doc.commit();
