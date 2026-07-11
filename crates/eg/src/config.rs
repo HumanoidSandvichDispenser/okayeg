@@ -23,6 +23,17 @@
 //! `identity` is the name and email announced to peers, like `git config
 //! user.name`. Self-asserted; it grants nothing. A key that is absent falls
 //! back to the same key in git config; a key set to `""` stays blank instead.
+//!
+//! ```toml
+//! [session]
+//! command = ["/usr/local/bin/notify-host", "project-42"]
+//! ```
+//!
+//! `session.command` names a program run once per session event on a serving
+//! repo. Its stdin is four newline-terminated lines: the event (`hello` at
+//! join, `bye` at leave), the peer's endpoint id, then its claimed name and
+//! email (blank when unset, and always blank for `bye`). It decides nothing:
+//! its exit status is ignored and a failure only logs.
 
 use std::io;
 use std::path::Path;
@@ -45,6 +56,10 @@ pub struct Config {
     /// The `[identity] email` announced to peers, with the same fallback rule
     /// as `name`.
     pub email: Option<String>,
+
+    /// The `[session] command` argv, program first. `None` means session
+    /// events are not reported.
+    pub session_command: Option<Vec<String>>,
 }
 
 impl Config {
@@ -64,23 +79,26 @@ impl Config {
 
     fn parse(text: &str) -> io::Result<Self> {
         let value: toml::Table = text.parse().map_err(|e| bad(format!("{e}")))?;
-        let authz_command = match value.get("authz").and_then(|a| a.get("command")) {
-            None => None,
+
+        let command_field = |table: &str| match value.get(table).and_then(|t| t.get("command")) {
+            None => Ok(None),
             Some(v) => {
                 let arr = v
                     .as_array()
-                    .ok_or_else(|| bad("authz.command must be an array of strings"))?;
+                    .ok_or_else(|| bad(format!("{table}.command must be an array of strings")))?;
                 let cmd = arr
                     .iter()
                     .map(|item| item.as_str().map(str::to_owned))
                     .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| bad("authz.command must be an array of strings"))?;
+                    .ok_or_else(|| bad(format!("{table}.command must be an array of strings")))?;
                 if cmd.is_empty() {
-                    return Err(bad("authz.command must name a program"));
+                    return Err(bad(format!("{table}.command must name a program")));
                 }
-                Some(cmd)
+                Ok(Some(cmd))
             }
         };
+        let authz_command = command_field("authz")?;
+        let session_command = command_field("session")?;
 
         let identity_field = |key: &str| match value.get("identity").and_then(|t| t.get(key)) {
             None => Ok(None),
@@ -92,7 +110,7 @@ impl Config {
         let name = identity_field("name")?;
         let email = identity_field("email")?;
 
-        Ok(Self { authz_command, name, email })
+        Ok(Self { authz_command, name, email, session_command })
     }
 }
 
@@ -117,6 +135,13 @@ mod tests {
             config.authz_command,
             Some(vec!["/bin/authz".to_owned(), "project-42".to_owned()])
         );
+    }
+
+    #[test]
+    fn session_command_parses_like_authz() {
+        let config = Config::parse("[session]\ncommand = [\"/bin/notify\"]\n").unwrap();
+        assert_eq!(config.session_command, Some(vec!["/bin/notify".to_owned()]));
+        assert!(Config::parse("[session]\ncommand = []\n").is_err());
     }
 
     #[test]

@@ -91,6 +91,38 @@ fn label(identity: &Identity, who: &EndpointId) -> String {
     parts.join(" ")
 }
 
+/// Report a session event to the `[session] command` hook, when one is
+/// configured. Fire and forget: the hook decides nothing, a failure only logs.
+fn run_session_hook(cmd: &Rc<Option<Vec<String>>>, event: &str, who: &EndpointId, identity: &Identity) {
+    let Some(cmd) = cmd.as_ref() else { return };
+
+    let stdin_body = format!(
+        "{event}\n{who}\n{}\n{}\n",
+        identity.name.as_deref().unwrap_or(""),
+        identity.email.as_deref().unwrap_or("")
+    );
+    let child = tokio::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+
+    let program = cmd[0].clone();
+    tokio::task::spawn_local(async move {
+        let run = async {
+            let mut child = child?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(stdin_body.as_bytes()).await?;
+            }
+            child.wait().await
+        };
+        if let Err(e) = run.await {
+            eprintln!("eg serve: session hook {program}: {e}");
+        }
+    });
+}
+
 /// Exchange hellos on a fresh stream, bounded by [`HELLO_TIMEOUT`].
 async fn exchange_hello<W, R>(
     send: &mut W,
@@ -212,6 +244,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
         let config = Config::load(&*ws)?;
         let me = Rc::new(local_identity(&config, &base));
+        let session_hook = Rc::new(config.session_command.clone());
 
         // The gate deciding each incoming connection: the authz command from
         // .eg/config.toml when one is configured, the trust file otherwise. The
@@ -233,7 +266,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         };
 
         let sessions: Sessions = Rc::new(RefCell::new(Vec::new()));
-        spawn_repl(sessions.clone(), base);
+        spawn_repl(sessions.clone(), base, session_hook.clone());
 
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
@@ -241,6 +274,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                     let doc = doc.clone();
                     let changed = changed.clone();
                     let me = me.clone();
+                    let hook = session_hook.clone();
                     let identity = Rc::new(RefCell::new(Identity::default()));
 
                     // the hello wait lives in the session task, so a peer that
@@ -260,11 +294,13 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                             label(&peer, &who),
                             trust::flags(perms)
                         );
+                        run_session_hook(&hook, "hello", &who, &peer);
                         *session_identity.borrow_mut() = peer;
 
                         if let Err(e) = drive_live(doc, send, recv, perms, changed).await {
                             eprintln!("eg serve: {who} dropped: {e}");
                         }
+                        run_session_hook(&hook, "bye", &who, &Identity::default());
                     });
 
                     let mut sessions = sessions.borrow_mut();
@@ -326,7 +362,7 @@ enum ReplCmd {
 ///
 /// EOF on stdin ends the repl and serving continues, so `eg serve < /dev/null`
 /// still works headless.
-fn spawn_repl(sessions: Sessions, dir: PathBuf) {
+fn spawn_repl(sessions: Sessions, dir: PathBuf, hook: Rc<Option<Vec<String>>>) {
     tokio::task::spawn_local(async move {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -335,14 +371,14 @@ fn spawn_repl(sessions: Sessions, dir: PathBuf) {
                 continue;
             }
             match <ReplCmd as clap::Parser>::try_parse_from(line.split_whitespace()) {
-                Ok(cmd) => run_repl_cmd(cmd, &sessions, &dir),
+                Ok(cmd) => run_repl_cmd(cmd, &sessions, &dir, &hook),
                 Err(e) => print!("{e}"), // clap's own usage/help text
             }
         }
     });
 }
 
-fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path) {
+fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path, hook: &Rc<Option<Vec<String>>>) {
     match cmd {
         ReplCmd::Sessions => {
             let mut sessions = sessions.borrow_mut();
@@ -358,6 +394,8 @@ fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path) {
             sessions.retain(|s| {
                 if s.who == id && !s.handle.is_finished() {
                     s.handle.abort();
+                    // an aborted session task never reaches its own bye
+                    run_session_hook(hook, "bye", &s.who, &Identity::default());
                     dropped += 1;
                 }
                 s.who != id
