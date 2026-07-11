@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use okayeg::{Doc, LiveSync, Msg, Step, Sync, SyncError};
+use okayeg::{Doc, LiveSync, Msg, Presence, Step, Sync, SyncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 
@@ -68,6 +68,41 @@ pub enum Accepted<T: Transport + ?Sized> {
 
 /// A doc shared between the live drivers, the watcher, and the exporter.
 pub type Shared = Rc<Doc>;
+
+/// One live session's tie into the doc's shared [`Presence`] store.
+///
+/// Sessions on the same doc share the store and the relay; `owner` is what
+/// differs per session.
+pub struct PresenceLink {
+    /// The store shared by every session on this doc.
+    pub presence: Presence,
+
+    /// Sanitized updates fanned out to every session: the originating peer's
+    /// key namespace and the bytes to forward.
+    pub relay: broadcast::Sender<(String, Vec<u8>)>,
+
+    /// The namespace this session's peer may write: the key itself and keys
+    /// under `namespace/`. `None` means the peer is the host, the one party
+    /// that may carry every key, since what it relays was already sanitized.
+    pub owner: Option<String>,
+}
+
+impl PresenceLink {
+    /// Apply an incoming frame, keeping only entries `owner` may write.
+    /// Returns the surviving bytes for relay, or `None` when nothing survived
+    /// or the frame did not decode.
+    fn apply(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let allowed = |k: &str| match &self.owner {
+            Some(ns) => {
+                k == ns
+                    || k.strip_prefix(ns.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
+            }
+            None => true,
+        };
+        self.presence.apply_from(bytes, allowed).ok().flatten()
+    }
+}
 
 /// The okayeg sync protocol, as named on the iroh wire.
 pub const ALPN: &[u8] = b"okayeg/sync/0";
@@ -257,7 +292,13 @@ where
     write_frame(&mut send, &sync.start().encode()).await?;
     loop {
         let frame = read_frame(&mut recv).await?;
-        match sync.on(decode_frame(&frame)?)? {
+        let msg = decode_frame(&frame)?;
+        // a live host streams presence beside the sync; a one-shot exchange has
+        // no store for it
+        if matches!(msg, Msg::Ephemeral(_)) {
+            continue;
+        }
+        match sync.on(msg)? {
             Step::Send(msg) => write_frame(&mut send, &msg.encode()).await?,
             Step::Done => break,
         }
@@ -272,12 +313,18 @@ where
 /// `changed` is the repo-wide nudge: this subscribes to know when to push, and
 /// fires it after an import that moved the doc so the other peers and the
 /// exporter react. Returns when the stream closes or errors.
+///
+/// `presence` ties the session into the doc's shared [`Presence`] store, or
+/// `None` for a sync-only session. With a link, incoming [`Msg::Ephemeral`]
+/// frames apply to the store under the ownership rule and the survivors fan
+/// out on the relay; relayed frames from other sessions stream to the peer.
 pub async fn drive_live<W, R>(
     doc: Shared,
     mut send: W,
     recv: R,
     perms: Perms,
     changed: broadcast::Sender<()>,
+    presence: Option<PresenceLink>,
 ) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
@@ -285,8 +332,14 @@ where
 {
     let mut nudged = changed.subscribe();
     let mut live = LiveSync::new(perms);
+    let mut relayed = presence.as_ref().map(|link| link.relay.subscribe());
 
     write_frame(&mut send, &live.start(&doc).encode()).await?;
+    if let Some(link) = &presence {
+        // opening snapshot, so the peer starts with the full picture
+        let snapshot = Msg::Ephemeral(link.presence.encode_all());
+        write_frame(&mut send, &snapshot.encode()).await?;
+    }
 
     // this exists so nudge doesn't just drop the in-flight read half way through a frame
     async fn next_frame<R: AsyncRead + Unpin>(mut recv: R) -> (R, Result<Vec<u8>, Error>) {
@@ -301,13 +354,49 @@ where
         tokio::select! {
             biased;
             (recv, frame) = &mut read => {
-                let out = live.on(&doc, decode_frame(&frame?)?)?;
+                let msg = decode_frame(&frame?)?;
                 read.set(next_frame(recv));
-                if let Some(msg) = out.send {
-                    write_frame(&mut send, &msg.encode()).await?;
+                match msg {
+                    Msg::Ephemeral(bytes) => {
+                        if let Some(link) = &presence {
+                            let sane = link.apply(&bytes);
+                            // only a namespaced peer's entries relay onward; a
+                            // frame from the host was itself a relay, and there
+                            // is no session beyond this one to feed
+                            if let (Some(ns), Some(sane)) = (&link.owner, sane) {
+                                let _ = link.relay.send((ns.clone(), sane));
+                            }
+                        }
+                    }
+                    msg => {
+                        let out = live.on(&doc, msg)?;
+                        if let Some(msg) = out.send {
+                            write_frame(&mut send, &msg.encode()).await?;
+                        }
+                        if out.changed {
+                            let _ = changed.send(());
+                        }
+                    }
                 }
-                if out.changed {
-                    let _ = changed.send(());
+            }
+            item = async { relayed.as_mut().expect("guarded by arm condition").recv().await },
+                if relayed.is_some() =>
+            {
+                let link = presence.as_ref().expect("relayed implies a link");
+                match item {
+                    // do not echo a peer's own entries back at it
+                    Ok((origin, bytes)) if link.owner.as_deref() != Some(origin.as_str()) => {
+                        write_frame(&mut send, &Msg::Ephemeral(bytes).encode()).await?;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // the store is last-value, so a snapshot is the catch-up
+                        let snapshot = Msg::Ephemeral(link.presence.encode_all());
+                        write_frame(&mut send, &snapshot.encode()).await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        relayed = None;
+                    }
                 }
             }
             nudge = nudged.recv() => {
@@ -577,7 +666,7 @@ mod tests {
                         .accept(&from_fn(|_: u64| async { Some(Perms::all()) }))
                         .await
                     {
-                        let _ = drive_live(bd, send, recv, perms, bc).await;
+                        let _ = drive_live(bd, send, recv, perms, bc, None).await;
                     }
                 });
                 // dialer
@@ -585,7 +674,7 @@ mod tests {
                 let ac = ca.clone();
                 tokio::task::spawn_local(async move {
                     let (send, recv, _g) = a.dial(2).await.unwrap();
-                    let _ = drive_live(ad, send, recv, Perms::all(), ac).await;
+                    let _ = drive_live(ad, send, recv, Perms::all(), ac, None).await;
                 });
 
                 // a's edit reaches b
@@ -599,6 +688,103 @@ mod tests {
                 doc_b.commit();
                 let _ = cb.send(());
                 converge(|| doc_a.text("body").to_string() == "hello world").await;
+            })
+            .await;
+    }
+
+    // The hub topology end to end: two spokes on one host, presence flowing
+    // spoke -> host -> other spoke, the opening snapshot, and a spoke's write
+    // to a foreign key dying at the host.
+    #[tokio::test]
+    async fn presence_relays_between_spokes_and_drops_foreign_keys() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (host_a, spoke_a) = MemTransport::pair();
+                let (host_b, spoke_b) = MemTransport::pair();
+
+                let host_doc: Shared = Rc::new(Doc::new());
+                let (host_changed, _) = broadcast::channel::<()>(64);
+                let host_presence = Presence::new(30_000);
+                let (relay, _) = broadcast::channel::<(String, Vec<u8>)>(64);
+                host_presence.set("host", "here");
+
+                for (transport, ns) in [(host_a, "a"), (host_b, "b")] {
+                    let doc = host_doc.clone();
+                    let changed = host_changed.clone();
+                    let link = PresenceLink {
+                        presence: host_presence.clone(),
+                        relay: relay.clone(),
+                        owner: Some(ns.into()),
+                    };
+                    tokio::task::spawn_local(async move {
+                        if let Ok(Accepted::Peer {
+                            send, recv, perms, ..
+                        }) = transport
+                            .accept(&from_fn(|_: u64| async { Some(Perms::all()) }))
+                            .await
+                        {
+                            let _ = drive_live(doc, send, recv, perms, changed, Some(link)).await;
+                        }
+                    });
+                }
+
+                // a spoke: its own store, local updates feeding its relay, and
+                // a host-facing link (owner None)
+                let spoke = |transport: MemTransport, id: &str| {
+                    let doc: Shared =
+                        Rc::new(Doc::from_snapshot(&host_doc.snapshot().unwrap()).unwrap());
+                    let (changed, _) = broadcast::channel::<()>(64);
+                    let presence = Presence::new(30_000);
+                    let (relay, _) = broadcast::channel::<(String, Vec<u8>)>(64);
+
+                    let sub = {
+                        let relay = relay.clone();
+                        let id = id.to_string();
+                        presence.subscribe_local_updates(Box::new(move |bytes| {
+                            let _ = relay.send((id.clone(), bytes.clone()));
+                            true
+                        }))
+                    };
+
+                    let link = PresenceLink {
+                        presence: presence.clone(),
+                        relay,
+                        owner: None,
+                    };
+                    let task_presence = presence.clone();
+                    tokio::task::spawn_local(async move {
+                        let _sub = sub; // feed local updates for the session's lifetime
+                        let _keep = task_presence;
+                        let (send, recv, _g) = transport.dial(0).await.unwrap();
+                        let _ =
+                            drive_live(doc, send, recv, Perms::all(), changed, Some(link)).await;
+                    });
+                    presence
+                };
+
+                let pa = spoke(spoke_a, "a");
+                let pb = spoke(spoke_b, "b");
+
+                // the opening snapshot lands on both spokes
+                converge(|| pa.get("host").is_some() && pb.get("host").is_some()).await;
+
+                // a's entry reaches b through the host
+                pa.set("a", "hi");
+                converge(|| pb.get("a").is_some()).await;
+
+                // a writes b's key: dropped at the host, never relayed. The
+                // following write to a's own key still flows, showing the
+                // session survived the bad frame.
+                pa.set("b", "spoofed");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                pa.set("a", "hi2");
+                converge(|| pb.get("a") == Some("hi2".into())).await;
+                assert_eq!(
+                    host_presence.get("b"),
+                    None,
+                    "foreign write landed on the host"
+                );
+                assert_eq!(pb.get("b"), None, "foreign write relayed to a spoke");
             })
             .await;
     }
@@ -669,8 +855,15 @@ mod tests {
                 let ad = a.clone();
                 let drive_changed = changed.clone();
                 tokio::task::spawn_local(async move {
-                    let _ = drive_live(ad, tokio::io::sink(), a_recv, Perms::all(), drive_changed)
-                        .await;
+                    let _ = drive_live(
+                        ad,
+                        tokio::io::sink(),
+                        a_recv,
+                        Perms::all(),
+                        drive_changed,
+                        None,
+                    )
+                    .await;
                 });
 
                 // Deliver only the header, then let drive_live park mid-frame.

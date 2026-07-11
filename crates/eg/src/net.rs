@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-use okayeg::{Doc, NodeKind};
+use okayeg::{Doc, LoroValue, NodeKind, Presence};
 use okayeg_net::{
-    Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity, Node, Perms, Shared,
-    Transport, drive_live, hello,
+    Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity, Node, Perms,
+    PresenceLink, Shared, Transport, drive_live, hello,
 };
 use tokio::sync::broadcast;
 
@@ -37,6 +37,58 @@ const DOC_PATH: &str = ".eg/doc";
 
 /// How long to wait for a peer's hello before dropping the connection.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a presence entry lives without a refresh.
+const PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wire this node's presence: set its own entry under `key`, feed local
+/// updates into the relay, and keep the entry fresh while sweeping expired
+/// peers. Returns the subscription, which can be dropped to stop feeding the
+/// relay.
+fn wire_presence(
+    presence: &Presence,
+    relay: &broadcast::Sender<(String, Vec<u8>)>,
+    key: String,
+    identity: &Identity,
+) -> okayeg::Subscription {
+    let sub = {
+        let relay = relay.clone();
+        let key = key.clone();
+        presence.subscribe_local_updates(Box::new(move |bytes| {
+            let _ = relay.send((key.clone(), bytes.clone()));
+            true
+        }))
+    };
+
+    let entry = presence_value(identity);
+    presence.set(&key, entry.clone());
+
+    // re-set well inside the timeout so the entry never expires while we live
+    let keep = presence.clone();
+    tokio::task::spawn_local(async move {
+        let mut tick = tokio::time::interval(PRESENCE_TIMEOUT / 3);
+        loop {
+            tick.tick().await;
+            keep.set(&key, entry.clone());
+            keep.remove_outdated();
+        }
+    });
+
+    sub
+}
+
+/// The presence entry for `identity`: its name and email as a map, unset
+/// fields left out.
+fn presence_value(identity: &Identity) -> LoroValue {
+    let mut map = std::collections::HashMap::new();
+    if let Some(name) = &identity.name {
+        map.insert("name".to_string(), LoroValue::from(name.as_str()));
+    }
+    if let Some(email) = &identity.email {
+        map.insert("email".to_string(), LoroValue::from(email.as_str()));
+    }
+    LoroValue::from(map)
+}
 
 /// The identity announced in this repo's hellos: `[identity]` from the config,
 /// falling back per field to git config for anything unset. An empty string in
@@ -256,6 +308,10 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         let me = Rc::new(local_identity(&config, &base));
         let session_hook = Rc::new(config.session_command.clone());
 
+        let presence = Presence::new(PRESENCE_TIMEOUT.as_millis() as i64);
+        let (relay, _) = broadcast::channel(64);
+        let _presence_sub = wire_presence(&presence, &relay, node.id().to_string(), &me);
+
         // The gate deciding each incoming connection: the authz command from
         // .eg/config.toml when one is configured, the trust file otherwise. The
         // config is read once here at startup; a policy change reaches a running
@@ -292,6 +348,11 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                     let me = me.clone();
                     let hook = session_hook.clone();
                     let identity = Rc::new(RefCell::new(Identity::default()));
+                    let link = PresenceLink {
+                        presence: presence.clone(),
+                        relay: relay.clone(),
+                        owner: Some(who.to_string()),
+                    };
 
                     // the hello wait lives in the session task, so a peer that
                     // opens a stream and goes silent stalls only itself
@@ -313,7 +374,9 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
                         run_session_hook(&hook, "hello", &who, &peer);
                         *session_identity.borrow_mut() = peer;
 
-                        if let Err(e) = drive_live(doc, send, recv, perms, changed).await {
+                        if let Err(e) =
+                            drive_live(doc, send, recv, perms, changed, Some(link)).await
+                        {
                             eprintln!("eg serve: {who} dropped: {e}");
                         }
                         run_session_hook(&hook, "bye", &who, &Identity::default());
@@ -483,6 +546,10 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
         let me = local_identity(&Config::load(&*ws)?, &base);
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
 
+        let presence = Presence::new(PRESENCE_TIMEOUT.as_millis() as i64);
+        let (relay, _) = broadcast::channel(64);
+        let _presence_sub = wire_presence(&presence, &relay, node.id().to_string(), &me);
+
         println!("eg join: syncing live with {id} (ctrl-c to stop)");
 
         let (mut send, mut recv, _guard) = node.dial(id).await.map_err(to_io)?;
@@ -494,7 +561,12 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
             println!("eg join: host is {}", label(&host, &id));
         }
 
-        if let Err(e) = drive_live(doc, send, recv, Perms::all(), changed).await {
+        let link = PresenceLink {
+            presence,
+            relay,
+            owner: None,
+        };
+        if let Err(e) = drive_live(doc, send, recv, Perms::all(), changed, Some(link)).await {
             return Err(report_sync_error("eg join", &id, e));
         }
 

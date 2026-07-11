@@ -213,7 +213,9 @@ mod client {
             let callbacks = self.callbacks.clone();
             spawn_local(async move {
                 let _conn = conn; // hold the link open for the session
-                let reason = match drive_live(doc, send, recv, Perms::all(), changed).await {
+                // TODO: pass a PresenceLink (owner None) once the browser
+                // presence API lands
+                let reason = match drive_live(doc, send, recv, Perms::all(), changed, None).await {
                     Ok(()) => "peer closed".to_string(),
                     Err(e) => format!("sync ended: {e}"),
                 };
