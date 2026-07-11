@@ -37,6 +37,11 @@ impl std::fmt::Display for PresenceError {
 
 impl std::error::Error for PresenceError {}
 
+/// Returns true if `key` is `owner` or a subkey under `owner/`.
+pub fn owns_key(owner: &str, key: &str) -> bool {
+    return key == owner || key.strip_prefix(owner).is_some_and(|r| r.starts_with('/'));
+}
+
 /// The ephemeral state shared with peers during a live session.
 ///
 /// Cloning hands out another handle to the same store.
@@ -117,7 +122,7 @@ impl Presence {
         owner: Option<&str>,
     ) -> Result<Option<Vec<u8>>, PresenceError> {
         self.apply_from(bytes, |k| match owner {
-            Some(owner) => k == owner || k.strip_prefix(owner).is_some_and(|r| r.starts_with('/')),
+            Some(owner) => owns_key(owner, k),
             None => true,
         })
     }
