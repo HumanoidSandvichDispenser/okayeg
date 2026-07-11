@@ -1,6 +1,6 @@
 {
   "name": "@sandvichxyz/okayeg-wasm",
-  "version": "0.1.0-3",
+  "version": "0.1.0-4",
   "license": "AGPL-3.0-only",
   "exports": {
     ".": "./pkg/okayeg_wasm.js",
