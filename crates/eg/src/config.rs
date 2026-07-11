@@ -13,6 +13,16 @@
 //! newline-terminated on stdin, and answers `pull` and/or `push` on stdout (see
 //! [`CommandAuthorizer`](okayeg_net::CommandAuthorizer)). When the table is
 //! absent, `.eg/trust` decides as before.
+//!
+//! ```toml
+//! [identity]
+//! name = "alice"
+//! email = "alice@example.com"
+//! ```
+//!
+//! `identity` is the name and email announced to peers, like `git config
+//! user.name`. Self-asserted; it grants nothing. A key that is absent falls
+//! back to the same key in git config; a key set to `""` stays blank instead.
 
 use std::io;
 use std::path::Path;
@@ -27,6 +37,14 @@ pub struct Config {
     /// The `[authz] command` argv, program first. `None` means the trust file
     /// gates connections.
     pub authz_command: Option<Vec<String>>,
+
+    /// The `[identity] name` announced to peers. `None` when absent (git
+    /// config decides); `Some("")` keeps it blank.
+    pub name: Option<String>,
+
+    /// The `[identity] email` announced to peers, with the same fallback rule
+    /// as `name`.
+    pub email: Option<String>,
 }
 
 impl Config {
@@ -63,7 +81,18 @@ impl Config {
                 Some(cmd)
             }
         };
-        Ok(Self { authz_command })
+
+        let identity_field = |key: &str| match value.get("identity").and_then(|t| t.get(key)) {
+            None => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(|s| Some(s.to_owned()))
+                .ok_or_else(|| bad(format!("identity.{key} must be a string"))),
+        };
+        let name = identity_field("name")?;
+        let email = identity_field("email")?;
+
+        Ok(Self { authz_command, name, email })
     }
 }
 
@@ -96,5 +125,17 @@ mod tests {
         assert!(Config::parse("[authz]\ncommand = \"authz\"\n").is_err()); // not an array
         assert!(Config::parse("[authz]\ncommand = [1]\n").is_err()); // not strings
         assert!(Config::parse("[authz]\ncommand = []\n").is_err()); // no program
+        assert!(Config::parse("[identity]\nname = 1\n").is_err()); // not a string
+    }
+
+    #[test]
+    fn identity_distinguishes_absent_from_blank() {
+        let config = Config::parse("[identity]\nname = \"alice\"\nemail = \"\"\n").unwrap();
+        assert_eq!(config.name.as_deref(), Some("alice"));
+        assert_eq!(config.email.as_deref(), Some(""));
+
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.name, None);
+        assert_eq!(config.email, None);
     }
 }

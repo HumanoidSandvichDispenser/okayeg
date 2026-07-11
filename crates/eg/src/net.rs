@@ -15,8 +15,8 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use okayeg::{Doc, NodeKind};
 use okayeg_net::{
-    drive_live, Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Node, Perms, Shared,
-    Transport,
+    drive_live, hello, Accepted, Authorizer, CommandAuthorizer, Decision, EndpointId, Identity,
+    Node, Perms, Shared, Transport,
 };
 use tokio::sync::broadcast;
 
@@ -34,6 +34,78 @@ const KEY_PATH: &str = ".eg/key";
 
 // kept across runs so node ids stay stable; rebuilding from files each run duplicates them on merge
 const DOC_PATH: &str = ".eg/doc";
+
+/// How long to wait for a peer's hello before dropping the connection.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The identity announced in this repo's hellos: `[identity]` from the config,
+/// falling back per field to git config for anything unset. An empty string in
+/// the config keeps the field blank.
+fn local_identity(config: &Config, dir: &Path) -> Identity {
+    let field = |set: &Option<String>, key: &str| match set {
+        Some(s) => (!s.is_empty()).then(|| s.clone()),
+        None => git_config(dir, key),
+    };
+
+    Identity {
+        name: field(&config.name, "user.name"),
+        email: field(&config.email, "user.email"),
+    }
+}
+
+/// Read one git config value through the git binary, repo-local when `dir` is
+/// inside a git repo, global otherwise. `None` when git or the value is absent.
+fn git_config(dir: &Path, key: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8(out.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// A peer's display label: the claimed name and email alongside its key. The
+/// claimed part is peer text, so control characters are stripped.
+fn label(identity: &Identity, who: &EndpointId) -> String {
+    let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+
+    let mut parts = Vec::new();
+    if let Some(name) = &identity.name {
+        parts.push(clean(name));
+    }
+    if let Some(email) = &identity.email {
+        parts.push(format!("<{}>", clean(email)));
+    }
+    if parts.is_empty() {
+        return who.to_string();
+    }
+
+    parts.push(format!("({who})"));
+    parts.join(" ")
+}
+
+/// Exchange hellos on a fresh stream, bounded by [`HELLO_TIMEOUT`].
+async fn exchange_hello<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    mine: &Identity,
+) -> Result<Identity, okayeg_net::Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match tokio::time::timeout(HELLO_TIMEOUT, hello(send, recv, mine)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(okayeg_net::Error::Transport("hello timed out".into())),
+    }
+}
 
 /// Run an async command on a small current-thread runtime, inside a `LocalSet`
 /// so the live runtime can `spawn_local` tasks that hold the `!Send` doc.
@@ -138,11 +210,14 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
         println!("eg serve: listening as {}", node.id());
 
+        let config = Config::load(&*ws)?;
+        let me = Rc::new(local_identity(&config, &base));
+
         // The gate deciding each incoming connection: the authz command from
         // .eg/config.toml when one is configured, the trust file otherwise. The
         // config is read once here at startup; a policy change reaches a running
         // session only by closing it (the verdict lives with the connection).
-        let gate = match Config::load(&*ws)?.authz_command {
+        let gate = match config.authz_command {
             Some(cmd) => {
                 println!("  authz: {}", cmd.join(" "));
                 let mut authz = CommandAuthorizer::new(&cmd[0]);
@@ -162,19 +237,39 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 
         loop {
             match node.accept(&gate).await.map_err(to_io)? {
-                Accepted::Peer { who, perms, send, recv, guard } => {
-                    println!("eg serve: {who} joined ({})", trust::flags(perms));
+                Accepted::Peer { who, perms, mut send, mut recv, guard } => {
                     let doc = doc.clone();
                     let changed = changed.clone();
+                    let me = me.clone();
+                    let identity = Rc::new(RefCell::new(Identity::default()));
+
+                    // the hello wait lives in the session task, so a peer that
+                    // opens a stream and goes silent stalls only itself
+                    let session_identity = identity.clone();
                     let handle = tokio::task::spawn_local(async move {
                         let _guard = guard; // hold the link open for the session
+                        let peer = match exchange_hello(&mut send, &mut recv, &me).await {
+                            Ok(peer) => peer,
+                            Err(e) => {
+                                eprintln!("eg serve: {who} dropped during hello: {e}");
+                                return;
+                            }
+                        };
+                        println!(
+                            "eg serve: {} joined ({})",
+                            label(&peer, &who),
+                            trust::flags(perms)
+                        );
+                        *session_identity.borrow_mut() = peer;
+
                         if let Err(e) = drive_live(doc, send, recv, perms, changed).await {
                             eprintln!("eg serve: {who} dropped: {e}");
                         }
                     });
+
                     let mut sessions = sessions.borrow_mut();
                     sessions.retain(|s| !s.handle.is_finished());
-                    sessions.push(Session { who, perms, handle });
+                    sessions.push(Session { who, perms, identity, handle });
                 }
                 Accepted::Refused { who, message } => match message {
                     Some(msg) => println!("eg serve: refused {who}: {msg}"),
@@ -190,7 +285,12 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
 /// closes the connection; the capability and the connection end together.
 struct Session {
     who: EndpointId,
+
     perms: Perms,
+
+    /// The peer's claimed identity, filled in once its hello arrives.
+    identity: Rc<RefCell<Identity>>,
+
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -249,7 +349,7 @@ fn run_repl_cmd(cmd: ReplCmd, sessions: &Sessions, dir: &Path) {
             sessions.retain(|s| !s.handle.is_finished());
             println!("eg serve: {} session(s)", sessions.len());
             for s in sessions.iter() {
-                println!("  {} {}", s.who, trust::flags(s.perms));
+                println!("  {} {}", label(&s.identity.borrow(), &s.who), trust::flags(s.perms));
             }
         }
         ReplCmd::Revoke { id } => {
@@ -315,11 +415,20 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc: Shared = Rc::new(open_or_clone(&*ws)?);
         let node = Node::bind_with_secret(repo_secret(&*ws)?).await.map_err(to_io)?;
+        let me = local_identity(&Config::load(&*ws)?, &base);
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
 
         println!("eg join: syncing live with {id} (ctrl-c to stop)");
 
-        let (send, recv, _guard) = node.dial(id).await.map_err(to_io)?;
+        let (mut send, mut recv, _guard) = node.dial(id).await.map_err(to_io)?;
+        let host = match exchange_hello(&mut send, &mut recv, &me).await {
+            Ok(host) => host,
+            Err(e) => return Err(report_sync_error("eg join", &id, e)),
+        };
+        if !host.is_empty() {
+            println!("eg join: host is {}", label(&host, &id));
+        }
+
         if let Err(e) = drive_live(doc, send, recv, Perms::all(), changed).await {
             return Err(report_sync_error("eg join", &id, e));
         }
@@ -337,15 +446,18 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
         let node = Node::bind_with_secret(repo_secret(&ws)?).await.map_err(to_io)?;
+        let me = local_identity(&Config::load(&ws)?, dir);
 
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
-        if let Err(e) = node.sync_with(id, &doc, Duration::from_secs(timeout_secs)).await {
-            return Err(report_sync_error("eg pull", &id, e));
-        }
+        let host = match node.sync_with(id, &doc, &me, Duration::from_secs(timeout_secs)).await {
+            Ok(host) => host,
+            Err(e) => return Err(report_sync_error("eg pull", &id, e)),
+        };
 
         let files = store(&doc, &ws)?.len();
         println!(
-            "eg pull: synced with {id}, wrote {files} file(s) to {}",
+            "eg pull: synced with {}, wrote {files} file(s) to {}",
+            label(&host, &id),
             dir.display()
         );
         Ok(())

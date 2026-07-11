@@ -15,7 +15,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use okayeg::{Doc, Perms};
 
 use crate::{
-    drive, encode_refused, write_frame, Accepted, Authorizer, Decision, Error, Transport, ALPN,
+    drive, encode_refused, hello, write_frame, Accepted, Authorizer, Decision, Error, Identity,
+    Transport, ALPN,
 };
 
 /// How long a dial may take before we give up and report the peer unreachable.
@@ -104,8 +105,9 @@ impl Node {
         }
     }
 
-    /// Dial `peer` and run one full sync of `doc` against it, giving up on the
-    /// dial after `timeout`.
+    /// Dial `peer` and run one full sync of `doc` against it, announcing
+    /// `identity` and returning the peer's claimed one. Gives up on the dial
+    /// after `timeout`.
     ///
     /// The dialer grants the peer full perms; access control is the accepting
     /// side's job. One-shot: used by `pull` to clone or catch up and exit. Live
@@ -114,13 +116,19 @@ impl Node {
         &self,
         peer: impl Into<EndpointAddr>,
         doc: &Doc,
+        identity: &Identity,
         timeout: Duration,
-    ) -> Result<(), Error> {
+    ) -> Result<Identity, Error> {
         let conn = self.connect(peer, timeout).await?;
-        let (send, recv) = conn
+        let (mut send, mut recv) = conn
             .open_bi()
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
+
+        let peer_identity = tokio::time::timeout(timeout, hello(&mut send, &mut recv, identity))
+            .await
+            .map_err(|_elapsed| Error::Transport("hello timed out".into()))??;
+
         drive(doc, send, recv, Perms::all()).await?;
         // Do not close the connection ourselves: that would send a QUIC
         // CONNECTION_CLOSE and abort the stream still carrying our last frame
@@ -128,7 +136,7 @@ impl Node {
         // has consumed everything and closes, which it does once its own sync
         // completes.
         let _ = conn.closed().await;
-        Ok(())
+        Ok(peer_identity)
     }
 }
 
