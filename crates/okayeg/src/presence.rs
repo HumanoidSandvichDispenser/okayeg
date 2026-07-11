@@ -37,11 +37,6 @@ impl std::fmt::Display for PresenceError {
 
 impl std::error::Error for PresenceError {}
 
-/// Returns true if `key` is `owner` or a subkey under `owner/`.
-pub fn owns_key(owner: &str, key: &str) -> bool {
-    return key == owner || key.strip_prefix(owner).is_some_and(|r| r.starts_with('/'));
-}
-
 /// The ephemeral state shared with peers during a live session.
 ///
 /// Cloning hands out another handle to the same store.
@@ -112,6 +107,11 @@ impl Presence {
         Ok(Some(sane))
     }
 
+    /// Returns true if `key` is `owner` or a subkey under `owner/`.
+    pub fn owns_key(owner: &str, key: &str) -> bool {
+        return key == owner || key.strip_prefix(owner).is_some_and(|r| r.starts_with('/'));
+    }
+
     /// Apply a peer's encoded updates, keeping only entries `owner` may write:
     /// the key `owner` itself and any subkey under `owner/`. Returns the bytes
     /// that make up the scoped update, or `None` if nothing was kept. If
@@ -122,7 +122,7 @@ impl Presence {
         owner: Option<&str>,
     ) -> Result<Option<Vec<u8>>, PresenceError> {
         self.apply_from(bytes, |k| match owner {
-            Some(owner) => owns_key(owner, k),
+            Some(owner) => Self::owns_key(owner, k),
             None => true,
         })
     }
@@ -143,6 +143,41 @@ impl Presence {
     /// Watch local changes as encoded bytes, ready for the wire.
     pub fn subscribe_local_updates(&self, callback: LocalEphemeralCallback) -> Subscription {
         self.store.subscribe_local_updates(callback)
+    }
+
+    pub const CURSOR: &'static str = "cursor";
+
+    fn cursor_key(ns: &str) -> String {
+        format!("{}/{}", ns, Self::CURSOR)
+    }
+
+    pub fn set_cursor(&self, ns: &str, file: &str, anchor: &[u8], head: &[u8]) {
+        let value = LoroValue::Map(
+            [
+                ("file".to_string(), LoroValue::from(file)),
+                ("anchor".to_string(), LoroValue::from(anchor.to_vec())),
+                ("head".to_string(), LoroValue::from(head.to_vec())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        self.set(&Self::cursor_key(ns), value);
+    }
+
+    pub fn get_cursor(&self, ns: &str) -> Option<(String, Vec<u8>, Vec<u8>)> {
+        let key = Self::cursor_key(ns);
+
+        self.get(&key).and_then(|value| {
+            if let LoroValue::Map(map) = value {
+                let file = map.get("file")?.as_string()?.to_string();
+                let anchor = map.get("anchor")?.as_binary()?.to_vec();
+                let head = map.get("head")?.as_binary()?.to_vec();
+                Some((file, anchor, head))
+            } else {
+                None
+            }
+        })
     }
 }
 
