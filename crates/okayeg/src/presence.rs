@@ -78,9 +78,8 @@ impl Presence {
         self.store.encode_all()
     }
 
-    /// Apply a peer's encoded update, keeping only entries whose key passes
-    /// `allowed`. Returns the surviving bytes, re-encoded for relay, or
-    /// `None` when nothing survived.
+    /// Apply a peer's encoded update, keeping only entries whose key passes `allowed`. Returns the
+    /// bytes that make up the scoped update, or `None` if nothing was kept.
     pub fn apply_from(
         &self,
         bytes: &[u8],
@@ -106,6 +105,21 @@ impl Presence {
             .apply(&sane)
             .map_err(|_| PresenceError::Malformed)?;
         Ok(Some(sane))
+    }
+
+    /// Apply a peer's encoded updates, keeping only entries `owner` may write:
+    /// the key `owner` itself and any subkey under `owner/`. Returns the bytes
+    /// that make up the scoped update, or `None` if nothing was kept. If
+    /// `owner` is `None`, all keys are kept.
+    pub fn apply_owned(
+        &self,
+        bytes: &[u8],
+        owner: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, PresenceError> {
+        self.apply_from(bytes, |k| match owner {
+            Some(owner) => k == owner || k.strip_prefix(owner).is_some_and(|r| r.starts_with('/')),
+            None => true,
+        })
     }
 
     /// Purge entries past their timeout, notifying subscribers of removals.

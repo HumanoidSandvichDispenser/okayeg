@@ -88,19 +88,10 @@ pub struct PresenceLink {
 }
 
 impl PresenceLink {
-    /// Apply an incoming frame, keeping only entries `owner` may write.
-    /// Returns the surviving bytes for relay, or `None` when nothing survived
-    /// or the frame did not decode.
+    /// Apply an incoming frame, keeping only entries `owner` may write. Returns the surviving bytes
+    /// for relay, or `None` when nothing survived.
     fn apply(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let allowed = |k: &str| match &self.owner {
-            Some(ns) => {
-                k == ns
-                    || k.strip_prefix(ns.as_str())
-                        .is_some_and(|r| r.starts_with('/'))
-            }
-            None => true,
-        };
-        self.presence.apply_from(bytes, allowed).ok().flatten()
+        self.presence.apply_owned(bytes, self.owner.as_deref()).ok().flatten()
     }
 }
 
