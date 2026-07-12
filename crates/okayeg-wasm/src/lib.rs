@@ -25,6 +25,7 @@ mod wire;
 mod client {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use std::collections::HashMap;
 
@@ -169,7 +170,7 @@ mod client {
         /// changes to the registered callbacks. Endpoint binds lazily on the
         /// first [`connect`](Self::connect).
         fn from_secret(secret: SecretKey) -> Self {
-            let doc: Shared = Rc::new(Doc::new());
+            let doc: Shared = Arc::new(Doc::new());
             let (changed, _) = broadcast::channel(64);
             let callbacks = Rc::new(Callbacks::default());
 

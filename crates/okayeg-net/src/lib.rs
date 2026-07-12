@@ -1,7 +1,7 @@
 //! The common transport: iroh p2p plus the loop that drives okayeg's sync protocol over a
 //! connection.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use okayeg::{Doc, LiveSync, Msg, Presence, Step, Sync, SyncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -67,7 +67,7 @@ pub enum Accepted<T: Transport + ?Sized> {
 }
 
 /// A doc shared between the live drivers, the watcher, and the exporter.
-pub type Shared = Rc<Doc>;
+pub type Shared = Arc<Doc>;
 
 /// One live session's tie into the doc's shared [`Presence`] store.
 ///
@@ -91,7 +91,10 @@ impl PresenceLink {
     /// Apply an incoming frame, keeping only entries `owner` may write. Returns the surviving bytes
     /// for relay, or `None` when nothing survived.
     fn apply(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        self.presence.apply_owned(bytes, self.owner.as_deref()).ok().flatten()
+        self.presence
+            .apply_owned(bytes, self.owner.as_deref())
+            .ok()
+            .flatten()
     }
 }
 
@@ -432,7 +435,7 @@ pub use mem::MemTransport;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -495,9 +498,9 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (a, b) = MemTransport::pair();
-                let doc_a: Shared = Rc::new(Doc::new());
+                let doc_a: Shared = Arc::new(Doc::new());
                 let doc_b: Shared =
-                    Rc::new(Doc::from_snapshot(&doc_a.snapshot().unwrap()).unwrap());
+                    Arc::new(Doc::from_snapshot(&doc_a.snapshot().unwrap()).unwrap());
                 let (ca, _) = broadcast::channel::<()>(64);
                 let (cb, _) = broadcast::channel::<()>(64);
 
@@ -547,7 +550,7 @@ mod tests {
                 let (host_a, spoke_a) = MemTransport::pair();
                 let (host_b, spoke_b) = MemTransport::pair();
 
-                let host_doc: Shared = Rc::new(Doc::new());
+                let host_doc: Shared = Arc::new(Doc::new());
                 let (host_changed, _) = broadcast::channel::<()>(64);
                 let host_presence = Presence::new(30_000);
                 let (relay, _) = broadcast::channel::<(String, Vec<u8>)>(64);
@@ -577,7 +580,7 @@ mod tests {
                 // a host-facing link (owner None)
                 let spoke = |transport: MemTransport, id: &str| {
                     let doc: Shared =
-                        Rc::new(Doc::from_snapshot(&host_doc.snapshot().unwrap()).unwrap());
+                        Arc::new(Doc::from_snapshot(&host_doc.snapshot().unwrap()).unwrap());
                     let (changed, _) = broadcast::channel::<()>(64);
                     let presence = Presence::new(30_000);
                     let (relay, _) = broadcast::channel::<(String, Vec<u8>)>(64);
@@ -686,7 +689,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 // A peer edit, encoded as exactly one Updates frame.
-                let a: Shared = Rc::new(Doc::new());
+                let a: Shared = Arc::new(Doc::new());
                 let b = Doc::from_snapshot(&a.snapshot().unwrap()).unwrap();
                 b.text("body").insert(0, "hello").unwrap();
                 b.commit();

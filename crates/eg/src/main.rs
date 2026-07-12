@@ -8,6 +8,8 @@ mod bridge;
 mod config;
 mod filetree;
 mod ignore;
+mod keys;
+mod mount;
 mod net;
 mod trust;
 mod watch;
@@ -35,6 +37,10 @@ struct Cli {
     #[arg(short = 'C', value_name = "dir", global = true)]
     dir: Option<PathBuf>,
 
+    /// Run with this key: a keyring name, or a path to a raw secret file
+    #[arg(long, value_name = "name|path", global = true)]
+    key: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -58,6 +64,13 @@ enum Cmd {
     },
     /// Clone if empty, then sync live with a peer.
     Join { peer: String },
+    /// Mount a remote project as a read-only filesystem.
+    Mount {
+        /// A remote name from the global config, or `iroh://<endpoint-id>`.
+        target: String,
+        /// An existing empty directory to mount on.
+        mountpoint: PathBuf,
+    },
     #[command(flatten)]
     Shared(SharedCmd),
 }
@@ -92,10 +105,10 @@ enum SharedCmd {
 
 impl SharedCmd {
     /// Run against the repo at `dir`, already resolved.
-    fn run(self, dir: &Path) -> std::io::Result<()> {
+    fn run(self, dir: &Path, key: Option<&str>) -> std::io::Result<()> {
         match self {
-            SharedCmd::Id => net::id(dir),
-            SharedCmd::Status => net::status(dir),
+            SharedCmd::Id => net::id(dir, key),
+            SharedCmd::Status => net::status(dir, key),
             SharedCmd::Trust { peer, access } => net::trust(dir, &peer, perms_from(&access)),
             SharedCmd::Ls { path } => filetree::ls_stdio(dir, &path),
             SharedCmd::Cat { paths } => filetree::cat_stdio(dir, &paths),
@@ -124,14 +137,16 @@ fn perms_from(access: &[Access]) -> Perms {
 fn main() -> ExitCode {
     let cli = <Cli as clap::Parser>::parse();
     let dir = cli.dir.as_deref();
+    let key = cli.key.as_deref();
     run(match cli.cmd {
         Cmd::Snapshot { dir, out } => bridge::snapshot(&dir, &out),
         Cmd::Restore { input, dir } => bridge::restore(&input, &dir),
         Cmd::Watch { dir, out } => watch::watch(&dir, &out),
-        Cmd::Serve => with_repo(dir, net::serve),
-        Cmd::Pull { peer, timeout } => with_fresh(dir, |d| net::pull(d, &peer, timeout)),
-        Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer)),
-        Cmd::Shared(cmd) => with_repo(dir, |d| cmd.run(d)),
+        Cmd::Serve => with_repo(dir, |d| net::serve(d, key)),
+        Cmd::Pull { peer, timeout } => with_fresh(dir, |d| net::pull(d, &peer, timeout, key)),
+        Cmd::Join { peer } => with_fresh(dir, |d| net::join(d, &peer, key)),
+        Cmd::Mount { target, mountpoint } => mount::mount(&target, &mountpoint, key),
+        Cmd::Shared(cmd) => with_repo(dir, |d| cmd.run(d, key)),
     })
 }
 

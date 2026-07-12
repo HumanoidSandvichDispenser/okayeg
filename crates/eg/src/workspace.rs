@@ -35,9 +35,6 @@ pub trait Workspace {
     fn read_file(&self, rel: &Path) -> io::Result<Vec<u8>>;
     /// Write `contents` to the file at `rel`, creating parents as needed.
     fn write_file(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
-    /// Create a new owner-only (0600) file at `rel` with `contents`, for
-    /// secrets like the node key. Fails if it already exists.
-    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
     /// Write `contents` to `rel` as an owner-only (0600) file, creating or
     /// overwriting, for repo-private state like the doc and trust set.
     fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
@@ -95,19 +92,6 @@ impl Workspace for CapWorkspace {
             }
         }
         self.dir.write(rel, contents)
-    }
-
-    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
-        use cap_std::fs::{OpenOptions, OpenOptionsExt};
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.dir.create_dir_all(parent)?;
-            }
-        }
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true).mode(0o600);
-        let mut file = self.dir.open_with(rel, &opts)?;
-        std::io::Write::write_all(&mut file, contents)
     }
 
     fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
@@ -221,16 +205,6 @@ impl Workspace for MemWorkspace {
             .borrow_mut()
             .insert(rel.to_path_buf(), contents.to_vec());
         Ok(())
-    }
-
-    fn write_new_secret(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
-        if self.files.borrow().contains_key(rel) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                rel.display().to_string(),
-            ));
-        }
-        self.write_file(rel, contents)
     }
 
     fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {

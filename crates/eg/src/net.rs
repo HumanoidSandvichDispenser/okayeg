@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::RecursiveMode;
@@ -21,7 +22,8 @@ use okayeg_net::{
 use tokio::sync::broadcast;
 
 use crate::bridge::{export_tree, import_tree};
-use crate::config::Config;
+use crate::config::{Config, Effective};
+use crate::keys;
 use crate::to_io;
 use crate::trust::{self, Trust};
 use crate::watch;
@@ -29,7 +31,7 @@ use crate::workspace::{CapWorkspace, Workspace};
 
 use crate::EG_DIR;
 
-/// This node's secret key, the raw form of its identity. Owner-only.
+/// This repo's own key file.
 const KEY_PATH: &str = ".eg/key";
 
 // kept across runs so node ids stay stable; rebuilding from files each run duplicates them on merge
@@ -99,15 +101,15 @@ fn presence_value(identity: &Identity) -> LoroValue {
 /// The identity announced in this repo's presence entry: `[identity]` from the
 /// config, falling back per field to git config for anything unset. An empty
 /// string in the config keeps the field blank.
-fn local_identity(config: &Config, dir: &Path) -> Identity {
+fn local_identity(eff: &Effective, dir: &Path) -> Identity {
     let field = |set: &Option<String>, key: &str| match set {
         Some(s) => (!s.is_empty()).then(|| s.clone()),
         None => git_config(dir, key),
     };
 
     Identity {
-        name: field(&config.name, "user.name"),
-        email: field(&config.email, "user.email"),
+        name: field(&eff.name, "user.name"),
+        email: field(&eff.email, "user.email"),
     }
 }
 
@@ -195,7 +197,7 @@ fn presence_identity(presence: &Presence, who: &EndpointId) -> Identity {
 
 /// Run an async command on a small current-thread runtime, inside a `LocalSet`
 /// so the live runtime can `spawn_local` tasks that hold the `!Send` doc.
-fn block_on<F>(fut: F) -> std::io::Result<()>
+pub(crate) fn block_on<F>(fut: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
 {
@@ -205,26 +207,12 @@ where
     tokio::task::LocalSet::new().block_on(&rt, fut)
 }
 
-/// This repo's stable secret key, generating and persisting it on first use.
-///
-/// The key lives in `.eg/key` under the served directory, written 0600. Reusing
-/// it keeps the node's [`EndpointId`](okayeg_net::EndpointId) the same across
-/// restarts, so a peer can dial the same address twice and so trust can pin it.
-fn repo_secret(ws: &dyn Workspace) -> io::Result<[u8; 32]> {
-    match ws.read_file(Path::new(KEY_PATH)) {
-        Ok(bytes) => bytes.as_slice().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                ".eg/key is not 32 bytes; remove it to regenerate",
-            )
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let secret = okayeg_net::generate_secret();
-            ws.write_new_secret(Path::new(KEY_PATH), &secret)?;
-            Ok(secret)
-        }
-        Err(e) => Err(e),
-    }
+/// Load both config scopes, resolve them, and read the selected key's secret.
+fn effective(ws: &dyn Workspace, cli_key: Option<&str>) -> io::Result<(Effective, [u8; 32])> {
+    let repo = Config::load(ws)?;
+    let global = keys::load_global()?;
+    let has_repo_key = ws.read_file(Path::new(KEY_PATH)).is_ok();
+    keys::effective(&global, cli_key, &repo, has_repo_key, ws)
 }
 
 fn open_or_seed(ws: &dyn Workspace) -> io::Result<Doc> {
@@ -286,24 +274,23 @@ fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<Vec<PathBuf>> {
 
 /// Serve `dir` over iroh: watch local edits into the doc and sync every peer
 /// that connects, live, until interrupted.
-pub fn serve(dir: &Path) -> std::io::Result<()> {
+pub fn serve(dir: &Path, key: Option<&str>) -> std::io::Result<()> {
     let base = dir.canonicalize()?;
     let ws = Rc::new(open_repo(dir)?);
+    let (eff, secret) = effective(&*ws, key)?;
+
     block_on(async move {
-        let doc: Shared = Rc::new(open_or_seed(&*ws)?);
+        let doc: Shared = Arc::new(open_or_seed(&*ws)?);
         store(&doc, &*ws)?;
 
-        let node = Node::bind_with_secret(repo_secret(&*ws)?)
-            .await
-            .map_err(to_io)?;
+        let node = Node::bind_with_secret(secret).await.map_err(to_io)?;
         let _ = node.addr().await;
         let changed = spawn_watch_and_export(ws.clone(), base.clone(), doc.clone())?;
 
         println!("eg serve: listening as {}", node.id());
 
-        let config = Config::load(&*ws)?;
-        let me = Rc::new(local_identity(&config, &base));
-        let session_hook = Rc::new(config.session_command.clone());
+        let me = Rc::new(local_identity(&eff, &base));
+        let session_hook = Rc::new(eff.session_command.clone());
 
         let presence = Presence::new(PRESENCE_TIMEOUT.as_millis() as i64);
         let (relay, _) = broadcast::channel(64);
@@ -313,7 +300,7 @@ pub fn serve(dir: &Path) -> std::io::Result<()> {
         // .eg/config.toml when one is configured, the trust file otherwise. The
         // config is read once here at startup; a policy change reaches a running
         // session only by closing it (the verdict lives with the connection).
-        let gate = match config.authz_command {
+        let gate = match eff.authz_command {
             Some(cmd) => {
                 println!("  authz: {}", cmd.join(" "));
                 let mut authz = CommandAuthorizer::new(&cmd[0]);
@@ -477,7 +464,7 @@ fn run_repl_cmd(
             println!("eg serve: revoked {id} ({dropped} session(s) closed)");
         }
         ReplCmd::Shared(cmd) => {
-            if let Err(e) = cmd.run(dir) {
+            if let Err(e) = cmd.run(dir, None) {
                 println!("eg serve: {e}");
             }
         }
@@ -520,16 +507,15 @@ impl Authorizer for Gate {
 
 /// Clone `dir` from `peer` if empty, then hold a live session: local edits and
 /// the peer's stream both ways until the link drops.
-pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
+pub fn join(dir: &Path, peer: &str, key: Option<&str>) -> std::io::Result<()> {
     let base = dir.canonicalize()?;
     let ws = Rc::new(open_repo(dir)?);
+    let (eff, secret) = effective(&*ws, key)?;
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
-        let doc: Shared = Rc::new(open_or_clone(&*ws)?);
-        let node = Node::bind_with_secret(repo_secret(&*ws)?)
-            .await
-            .map_err(to_io)?;
-        let me = local_identity(&Config::load(&*ws)?, &base);
+        let doc: Shared = Arc::new(open_or_clone(&*ws)?);
+        let node = Node::bind_with_secret(secret).await.map_err(to_io)?;
+        let me = local_identity(&eff, &base);
         let changed = spawn_watch_and_export(ws.clone(), base, doc.clone())?;
 
         let presence = Presence::new(PRESENCE_TIMEOUT.as_millis() as i64);
@@ -555,14 +541,13 @@ pub fn join(dir: &Path, peer: &str) -> std::io::Result<()> {
 
 /// Pull from the peer named by `peer` (an endpoint id), merging into `dir`. One
 /// shot: clone or catch up, write the files, exit.
-pub fn pull(dir: &Path, peer: &str, timeout_secs: u64) -> std::io::Result<()> {
+pub fn pull(dir: &Path, peer: &str, timeout_secs: u64, key: Option<&str>) -> std::io::Result<()> {
     let ws = open_repo(dir)?;
+    let (_, secret) = effective(&ws, key)?;
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
-        let node = Node::bind_with_secret(repo_secret(&ws)?)
-            .await
-            .map_err(to_io)?;
+        let node = Node::bind_with_secret(secret).await.map_err(to_io)?;
 
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
         if let Err(e) = node
@@ -720,24 +705,21 @@ fn changed_paths(events: &[notify_debouncer_full::DebouncedEvent], base: &Path) 
     paths
 }
 
-/// Print this repo's endpoint id, the address a peer dials and trusts.
-///
-/// Generates the key on first use, so `eg id` also initializes `.eg/`.
-pub fn id(dir: &Path) -> io::Result<()> {
+/// Print this repo's endpoint id.
+pub fn id(dir: &Path, key: Option<&str>) -> io::Result<()> {
     let ws = open_repo(dir)?;
-    println!("{}", okayeg_net::id_from_secret(repo_secret(&ws)?));
+    let (_, secret) = effective(&ws, key)?;
+    println!("{}", okayeg_net::id_from_secret(secret));
     Ok(())
 }
 
 /// Print a read-only summary of this repo: its id, doc contents, and trust set.
-///
-/// While it does not seed anything, it generates the key on first use like [`id`], so a fresh
-/// directory still gets its `.eg/`.
-pub fn status(dir: &Path) -> io::Result<()> {
+pub fn status(dir: &Path, key: Option<&str>) -> io::Result<()> {
     let ws = open_repo(dir)?;
+    let (_, secret) = effective(&ws, key)?;
     // already absolute and canonical: with_repo ran `dir` through abs().
     println!("eg status: {}", dir.display());
-    println!("  id:    {}", okayeg_net::id_from_secret(repo_secret(&ws)?));
+    println!("  id:    {}", okayeg_net::id_from_secret(secret));
 
     match read_doc(&ws)? {
         Some(doc) => {

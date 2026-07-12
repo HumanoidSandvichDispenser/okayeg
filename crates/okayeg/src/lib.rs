@@ -11,7 +11,7 @@ mod tree;
 
 pub use comment::{Comment, Comments};
 pub use doc::Doc;
-pub use fs::{Change, DocFs, Entry, FsError, valid_name};
+pub use fs::{Change, DocFs, Entry, FsError, read_bytes, valid_name};
 pub use loro::awareness::{EphemeralEventTrigger, EphemeralStoreEvent};
 pub use loro::{Frontiers, LoroValue, Subscription};
 pub use presence::{Presence, PresenceError};

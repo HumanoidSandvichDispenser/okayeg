@@ -413,6 +413,42 @@ impl DocFs<'_> {
     }
 }
 
+/// Up to `size` bytes of `text` starting at byte `offset`.
+///
+/// Any offset is valid, including one inside a multibyte character or past the
+/// end; the range is clamped to the text.
+pub fn read_bytes(text: &LoroText, offset: usize, size: usize) -> Vec<u8> {
+    let len = text.len_utf8();
+    if offset >= len || size == 0 {
+        return Vec::new();
+    }
+    let end = len.min(offset.saturating_add(size));
+
+    // a byte offset can land inside a multibyte character, which loro rejects;
+    // widen to the enclosing char boundaries (at most 3 bytes each way in
+    // utf-8) and trim the exact range from the result
+    for widen_start in 0..4 {
+        for widen_end in 0..4 {
+            let start = offset.saturating_sub(widen_start);
+            let stop = len.min(end + widen_end);
+            let Ok(delta) = text.slice_delta(start, stop, loro::cursor::PosType::Bytes) else {
+                continue;
+            };
+
+            let mut bytes = Vec::with_capacity(stop - start);
+            for piece in delta {
+                if let loro::TextDelta::Insert { insert, .. } = piece {
+                    bytes.extend_from_slice(insert.as_bytes());
+                }
+            }
+            let from = offset - start;
+            let to = from + (end - offset);
+            return bytes[from..to].to_vec();
+        }
+    }
+    Vec::new()
+}
+
 /// The tree node a nested container belongs to: the last node index on its
 /// path from the root.
 fn node_in_path(path: &[(ContainerID, loro::Index)]) -> Option<TreeID> {
@@ -604,6 +640,33 @@ mod tests {
             seen.lock().unwrap().drain(..).collect::<Vec<_>>(),
             [Change::Removed { node }]
         );
+    }
+
+    #[test]
+    fn read_bytes_slices_any_byte_range() {
+        let doc = Doc::new();
+        let text = doc.text("t");
+        let content = "a😀b€c"; // 1 + 4 + 1 + 3 + 1 bytes
+        text.insert(0, content).unwrap();
+        doc.commit();
+        let bytes = content.as_bytes();
+
+        // every (offset, size) pair, including ones splitting a character
+        for offset in 0..=bytes.len() + 1 {
+            for size in 0..=bytes.len() + 2 {
+                let end = bytes.len().min(offset + size);
+                let expect = if offset >= bytes.len() {
+                    &[][..]
+                } else {
+                    &bytes[offset..end]
+                };
+                assert_eq!(
+                    read_bytes(&text, offset, size),
+                    expect,
+                    "offset={offset} size={size}"
+                );
+            }
+        }
     }
 
     #[test]

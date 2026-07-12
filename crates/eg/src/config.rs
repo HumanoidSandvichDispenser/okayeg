@@ -172,8 +172,8 @@ fn selector(s: &str) -> KeySelector {
 /// Merge the config scopes into the [`Effective`] settings.
 ///
 /// The key follows `cli_key` > `env_key` > the repo config > the repo's own
-/// `.eg/key` when `repo_key_file` > the referenced remote > the global config
-/// > [`DEVICE_KEY`]. Identity fields layer repo over remote over global.
+/// `.eg/key` when `repo_key_file` > the referenced remote > the global
+/// config > [`DEVICE_KEY`]. Identity fields layer repo over remote over global.
 /// Errors when the repo references a remote the global config does not define.
 pub fn resolve(
     cli_key: Option<&str>,
@@ -224,8 +224,8 @@ pub fn resolve(
 impl Config {
     /// Load `.eg/config.toml`, or defaults if it does not exist.
     ///
-    /// For security reasons, some keys such as authz hooks instead fatally error on malformed
-    /// input.
+    /// Malformed input is an error, never a fallback: keys like the authz hook
+    /// must not silently degrade.
     pub fn load(ws: &dyn Workspace) -> io::Result<Self> {
         let text = match ws.read_file(Path::new(CONFIG_PATH)) {
             Ok(bytes) => String::from_utf8(bytes).map_err(|e| bad(format!("not utf-8: {e}")))?,
@@ -249,16 +249,9 @@ impl Config {
             ));
         }
 
-        let string_field = |key: &str| match value.get(key) {
-            None => Ok(None),
-            Some(v) => v
-                .as_str()
-                .map(|s| Some(s.to_owned()))
-                .ok_or_else(|| bad(format!("{key} must be a string"))),
-        };
-        let remote = string_field("remote")?;
-        let peer = string_field("peer")?;
-        let key = string_field("key")?;
+        let remote = string_in(&value, "remote", "", bad)?;
+        let peer = string_in(&value, "peer", "", bad)?;
+        let key = string_in(&value, "key", "", bad)?;
 
         if remote.is_some() && peer.is_some() {
             return Err(bad(
@@ -321,13 +314,8 @@ impl GlobalConfig {
             }
         }
 
-        let string_in = |table: &toml::Table, key: &str, at: &str| match table.get(key) {
-            None => Ok(None),
-            Some(v) => v
-                .as_str()
-                .map(|s| Some(s.to_owned()))
-                .ok_or_else(|| bad_global(format!("{at}{key} must be a string"))),
-        };
+        let string_in =
+            |table: &toml::Table, key: &str, at: &str| string_in(table, key, at, bad_global);
 
         let key = string_in(&value, "key", "")?;
 
@@ -386,6 +374,23 @@ impl GlobalConfig {
             keys_backend,
             remotes,
         })
+    }
+}
+
+/// The optional string at `table[key]`, with `at` prefixing the key in the
+/// error `err` builds.
+fn string_in(
+    table: &toml::Table,
+    key: &str,
+    at: &str,
+    err: fn(String) -> io::Error,
+) -> io::Result<Option<String>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_owned()))
+            .ok_or_else(|| err(format!("{at}{key} must be a string"))),
     }
 }
 
