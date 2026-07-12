@@ -21,7 +21,7 @@ use okayeg_net::{
 };
 use tokio::sync::broadcast;
 
-use crate::bridge::{export_tree, import_tree};
+use crate::bridge::{ExportPlan, export_tree, import_tree};
 use crate::config::{Config, Effective};
 use crate::keys;
 use crate::to_io;
@@ -267,9 +267,20 @@ fn is_empty_repo(ws: &dyn Workspace) -> io::Result<bool> {
     }))
 }
 
-fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<Vec<PathBuf>> {
+fn store(doc: &Doc, ws: &dyn Workspace) -> io::Result<ExportPlan> {
     ws.write_private(Path::new(DOC_PATH), &doc.snapshot().map_err(to_io)?)?;
     export_tree(doc, ws)
+}
+
+/// Write the doc to disk and prune what a peer delete or rename left stale.
+fn export_and_prune(
+    doc: &Doc,
+    ws: &dyn Workspace,
+    mut bases: watch::FileBases,
+    mut dir_bases: watch::ExportDirs,
+) -> io::Result<usize> {
+    let plan = store(doc, ws)?;
+    Ok(watch::advance_and_prune(doc, ws, plan, &mut bases, &mut dir_bases))
 }
 
 /// Serve `dir` over iroh: watch local edits into the doc and sync every peer
@@ -547,6 +558,9 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64, key: Option<&str>) -> std
     block_on(async move {
         let id = EndpointId::from_str(peer).map_err(to_io)?;
         let doc = open_or_clone(&ws)?;
+        // Seed before the sync: a file the peer deleted or renamed is only
+        // visible at its old path now, and prune needs that agreement point.
+        let (bases, dir_bases) = watch::seed(&ws, &doc)?;
         let node = Node::bind_with_secret(secret).await.map_err(to_io)?;
 
         println!("eg pull: dialing {id} (up to {timeout_secs}s)...");
@@ -557,7 +571,7 @@ pub fn pull(dir: &Path, peer: &str, timeout_secs: u64, key: Option<&str>) -> std
             return Err(report_sync_error("eg pull", &id, e));
         }
 
-        let files = store(&doc, &ws)?.len();
+        let files = export_and_prune(&doc, &ws, bases, dir_bases)?;
         println!(
             "eg pull: synced with {id}, wrote {files} file(s) to {}",
             dir.display()
@@ -608,7 +622,8 @@ fn spawn_watch_and_export(
     doc: Shared,
 ) -> io::Result<broadcast::Sender<()>> {
     let (changed, _) = broadcast::channel::<()>(64);
-    let bases = Rc::new(RefCell::new(watch::seed_bases(&*ws, &doc)));
+    let (file_bases, dir_bases_init) = watch::seed(&*ws, &doc)?;
+    let bases = Rc::new(RefCell::new(file_bases));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut debouncer = new_debouncer(
@@ -658,23 +673,32 @@ fn spawn_watch_and_export(
         }
     });
 
-    // egress: on any nudge (local or peer), write the doc back to disk. Every
-    // written file now matches the doc, so its merge base moves to the current
-    // frontier.
+    // egress: on any nudge (local or peer), write the doc back to disk,
+    // advance the tracked maps, and prune what a peer delete or rename left
+    // stale (see [`watch::advance_and_prune`]). No await happens while `bases`
+    // is borrowed, and the ingest task on the same LocalSet cannot interleave
+    // inside that span, so the borrow is safe.
+    //
+    // `dir_bases` is egress-only, so it is owned outright here (no `Rc`/`RefCell`);
+    // `bases` stays `Rc<RefCell<>>` because the ingest task reads and advances it
+    // too.
     let out_ws = ws;
     let out_doc = doc;
+    let mut dir_bases = dir_bases_init;
     let mut nudged = changed.subscribe();
     tokio::task::spawn_local(async move {
         loop {
             match nudged.recv().await {
                 Err(broadcast::error::RecvError::Closed) => break,
                 _ => match store(&out_doc, &*out_ws) {
-                    Ok(written) => {
-                        let now = out_doc.frontiers();
-                        let mut bases = bases.borrow_mut();
-                        for path in written {
-                            bases.insert(path, now.clone());
-                        }
+                    Ok(plan) => {
+                        watch::advance_and_prune(
+                            &out_doc,
+                            &*out_ws,
+                            plan,
+                            &mut bases.borrow_mut(),
+                            &mut dir_bases,
+                        );
                     }
                     Err(e) => eprintln!("eg: export: {e}"),
                 },

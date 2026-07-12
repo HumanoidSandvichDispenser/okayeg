@@ -209,6 +209,36 @@ impl FileTree<'_> {
         doc.import(&updates).is_ok()
     }
 
+    /// A file node's content as of `base`, a read-only sibling of
+    /// [`set_content_at`](Self::set_content_at).
+    ///
+    /// `node` stays a valid lookup key in a fork at `base` even after the live
+    /// doc has deleted the node, so the lookup needs no path walking through the
+    /// live state. Returns `None` when the node was not a file at `base` or `base`
+    /// is not in this doc's history.
+    pub fn content_at(&self, node: TreeID, base: &Frontiers) -> Option<String> {
+        let doc = self.doc.inner();
+        let fork = doc.fork_at(base).ok()?;
+        let content = fork
+            .get_tree(Self::TREE)
+            .get_meta(node)
+            .ok()?
+            .get("content")?
+            .into_container()
+            .ok()?
+            .into_text()
+            .ok()?;
+        Some(content.to_string())
+    }
+
+    /// Whether `node` exists and is not deleted in the current doc state.
+    pub fn alive(&self, node: TreeID) -> bool {
+        match self.tree().is_node_deleted(&node) {
+            Ok(false) => true,
+            Ok(true) | Err(_) => false,
+        }
+    }
+
     /// A boundary node's reference. `None` for files and directories.
     pub fn reference(&self, node: TreeID) -> Option<String> {
         self.string_field(node, "ref")
@@ -316,6 +346,71 @@ mod tests {
         other.commit();
 
         assert!(!files.set_content_at(node, "x", &other.frontiers()));
+    }
+
+    #[test]
+    fn content_at_reads_a_deleted_nodes_content_at_the_base() {
+        // A file's content stays readable at the frontier where it was last
+        // written to disk, even after the live doc deletes the node.
+        let doc = Doc::new();
+        let files = doc.files();
+        let node = files.create_file(None, "notes.txt");
+        files.content(node).unwrap().insert(0, "hello").unwrap();
+        doc.commit();
+        let base = doc.frontiers();
+
+        // The peer deletes the node; the live doc imports the delete.
+        let peer = Doc::from_snapshot(&doc.snapshot().unwrap()).unwrap();
+        peer.files().delete(node);
+        peer.commit();
+        doc.import(&peer.updates_since(&doc.version()).unwrap())
+            .unwrap();
+        doc.commit();
+
+        // The node is gone from the live doc and not alive, but its content
+        // at the base frontier is still readable.
+        assert!(!files.alive(node));
+        assert_eq!(files.content_at(node, &base).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn content_at_returns_none_for_a_non_file_or_unknown_base() {
+        let doc = Doc::new();
+        let files = doc.files();
+        let file = files.create_file(None, "a.txt");
+        files.content(file).unwrap().insert(0, "x").unwrap();
+        let dir = files.create_dir(None, "d");
+        doc.commit();
+        let base = doc.frontiers();
+
+        // A directory is not a file: no content at any base.
+        assert_eq!(files.content_at(dir, &base), None);
+
+        // A base that is not in this doc's history produces None.
+        let other = Doc::new();
+        other.files().create_file(None, "b.txt");
+        other.commit();
+        assert_eq!(files.content_at(file, &other.frontiers()), None);
+    }
+
+    #[test]
+    fn alive_reports_deleted_and_unknown_as_dead() {
+        let doc = Doc::new();
+        let files = doc.files();
+        let node = files.create_file(None, "a.txt");
+        doc.commit();
+
+        // Live node is alive.
+        assert!(files.alive(node));
+
+        // A fabricated id the doc has never seen is not alive.
+        let unknown = TreeID::new(99, 777);
+        assert!(!files.alive(unknown));
+
+        // After deletion the node is not alive.
+        files.delete(node);
+        doc.commit();
+        assert!(!files.alive(node));
     }
 
     #[test]

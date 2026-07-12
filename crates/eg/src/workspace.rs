@@ -40,6 +40,11 @@ pub trait Workspace {
     fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()>;
     /// Create the directory at `rel` (and any missing parents).
     fn create_dir(&self, rel: &Path) -> io::Result<()>;
+    /// Remove the file at `rel`. `NotFound` when there is none.
+    fn remove_file(&self, rel: &Path) -> io::Result<()>;
+    /// Remove the directory at `rel`; it must be empty. `NotFound` when there
+    /// is none, `DirectoryNotEmpty` (or equivalent) when it holds children.
+    fn remove_dir(&self, rel: &Path) -> io::Result<()>;
     /// What is at `rel` right now: a file, a directory, or nothing.
     fn kind(&self, rel: &Path) -> io::Result<Option<Kind>>;
 }
@@ -115,6 +120,17 @@ impl Workspace for CapWorkspace {
             return Ok(());
         }
         self.dir.create_dir_all(rel)
+    }
+
+    fn remove_file(&self, rel: &Path) -> io::Result<()> {
+        self.dir.remove_file(rel)
+    }
+
+    fn remove_dir(&self, rel: &Path) -> io::Result<()> {
+        if rel.as_os_str().is_empty() {
+            return Ok(());
+        }
+        self.dir.remove_dir(rel)
     }
 
     fn kind(&self, rel: &Path) -> io::Result<Option<Kind>> {
@@ -216,6 +232,39 @@ impl Workspace for MemWorkspace {
             self.dirs.borrow_mut().insert(rel.to_path_buf());
         }
         Ok(())
+    }
+
+    fn remove_file(&self, rel: &Path) -> io::Result<()> {
+        if self.files.borrow_mut().remove(rel).is_some() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, rel.display().to_string()))
+        }
+    }
+
+    fn remove_dir(&self, rel: &Path) -> io::Result<()> {
+        // Empty iff no file or directory entry nests under `rel`.
+        let rel = rel.to_path_buf();
+        let files = self.files.borrow();
+        let dirs = self.dirs.borrow();
+        let occupied = files
+            .keys()
+            .any(|p| p.starts_with(&rel) && *p != rel)
+            || dirs.iter().any(|p| p.starts_with(&rel) && *p != rel);
+        if occupied {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                rel.display().to_string(),
+            ));
+        }
+        drop(files);
+        drop(dirs);
+        let was = self.dirs.borrow_mut().remove(&rel);
+        if was {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, rel.display().to_string()))
+        }
     }
 
     fn kind(&self, rel: &Path) -> io::Result<Option<Kind>> {

@@ -32,7 +32,7 @@ pub fn restore(file: &Path, dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let ws = CapWorkspace::open(dir)?;
     let doc = Doc::from_snapshot(&fs::read(file)?).map_err(to_io)?;
-    let files = export_tree(&doc, &ws)?.len();
+    let files = export_tree(&doc, &ws)?.files.len();
     println!(
         "restore: {files} file(s) from {} -> {}",
         file.display(),
@@ -103,19 +103,35 @@ fn import_dir(
     Ok(())
 }
 
-/// Write the doc's tree out into the workspace. Returns the written file
-/// paths, which the caller uses to advance per-file merge bases.
-pub fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<Vec<std::path::PathBuf>> {
+/// The files and directories that would be written, each paired with the doc node it came from.
+pub struct ExportPlan {
+    /// `(rel_path, node)` for every file written.
+    pub files: Vec<(std::path::PathBuf, TreeID)>,
+    /// `(rel_path, node)` for every directory ensured.
+    pub dirs: Vec<(std::path::PathBuf, TreeID)>,
+}
+
+/// Write the doc's tree out into the workspace. Returns every file written and
+/// directory ensured, each paired with its doc node.
+pub fn export_tree(doc: &Doc, ws: &dyn Workspace) -> std::io::Result<ExportPlan> {
     let ignorer = Ignorer::load(ws)?;
-    let mut files = Vec::new();
+    let mut plan = ExportPlan {
+        files: Vec::new(),
+        dirs: Vec::new(),
+    };
     for node in doc.files().roots() {
         // do not materialize any files in .eg
         if doc.files().name(node).as_deref() == Some(EG_DIR) {
             continue;
         }
-        export_node(doc, ws, &ignorer, node, Path::new(""), &mut files)?;
+        export_node(doc, ws, &ignorer, node, Path::new(""), &mut plan)?;
     }
-    Ok(files)
+    Ok(plan)
+}
+
+/// Whether export would write a node named `name` at `rel`.
+pub(crate) fn materializable(name: &str, rel: &Path, is_dir: bool, ignorer: &Ignorer) -> bool {
+    okayeg::valid_name(name) && !ignorer.should_ignore(rel, is_dir)
 }
 
 fn export_node(
@@ -124,33 +140,26 @@ fn export_node(
     ignorer: &Ignorer,
     node: TreeID,
     parent: &Path,
-    files: &mut Vec<std::path::PathBuf>,
+    plan: &mut ExportPlan,
 ) -> std::io::Result<()> {
     let tree = doc.files();
     let Some(name) = tree.name(node) else {
         return Ok(());
     };
-    // A peer can push a tree node with any name, including `..` or one
-    // carrying a separator. Materializing it would have cap-std refuse the
-    // write and abort the whole export (so no legitimate file lands either),
-    // and once the node is persisted in `.eg/doc` that failure recurs on
-    // every later serve. A node whose name has no path is skipped instead,
-    // with its subtree.
-    if !okayeg::valid_name(&name) {
-        eprintln!("eg: skipping tree node with unsafe name {name:?}");
-        return Ok(());
-    }
     let rel = parent.join(&name);
     let kind = tree.kind(node);
-    // Same skip set as import; `.eg/` is already handled by the caller.
-    if ignorer.should_ignore(&rel, matches!(kind, Some(NodeKind::Dir))) {
+    if !materializable(&name, &rel, matches!(kind, Some(NodeKind::Dir)), ignorer) {
+        if !okayeg::valid_name(&name) {
+            eprintln!("eg: skipping tree node with unsafe name {name:?}");
+        }
         return Ok(());
     }
     match kind {
         Some(NodeKind::Dir) => {
             ws.create_dir(&rel)?;
+            plan.dirs.push((rel.clone(), node));
             for child in tree.children(node) {
-                export_node(doc, ws, ignorer, child, &rel, files)?;
+                export_node(doc, ws, ignorer, child, &rel, plan)?;
             }
         }
         Some(NodeKind::File) => {
@@ -159,7 +168,7 @@ fn export_node(
                 .map(|c| c.to_string())
                 .unwrap_or_default();
             ws.write_file(&rel, text.as_bytes())?;
-            files.push(rel);
+            plan.files.push((rel, node));
         }
         // Boundaries point at another doc; nothing to write inline yet.
         Some(NodeKind::Boundary) | None => {}
@@ -196,7 +205,7 @@ mod tests {
         let bytes = doc.snapshot().unwrap();
         let restored_doc = Doc::from_snapshot(&bytes).unwrap();
         let dst = MemWorkspace::new();
-        let exported = export_tree(&restored_doc, &dst).unwrap().len();
+        let exported = export_tree(&restored_doc, &dst).unwrap().files.len();
         assert_eq!(exported, 3);
 
         // The restored files should match the originals.
@@ -241,7 +250,7 @@ mod tests {
         doc.commit();
 
         // Export completes (no aborting error) and writes only the safe file.
-        let files = export_tree(&doc, &ws).unwrap().len();
+        let files = export_tree(&doc, &ws).unwrap().files.len();
         assert_eq!(files, 1, "only ok.txt should materialize");
         assert_eq!(ws.read_file(Path::new("ok.txt")).unwrap(), b"ok");
         // Nothing escaped the root.
@@ -271,7 +280,7 @@ mod tests {
         doc.commit();
 
         let ws = MemWorkspace::new();
-        let files = export_tree(&doc, &ws).unwrap().len();
+        let files = export_tree(&doc, &ws).unwrap().files.len();
 
         assert_eq!(files, 1, "only README.md should be written, not .eg/key");
         assert_eq!(ws.read_file(Path::new("README.md")).unwrap(), b"ok");
@@ -300,7 +309,7 @@ mod tests {
         let dst = MemWorkspace::new();
         dst.write_file(Path::new(".eg/ignore"), b"secrets.env\ntarget/\n")
             .unwrap();
-        let exported = export_tree(&doc, &dst).unwrap().len();
+        let exported = export_tree(&doc, &dst).unwrap().files.len();
         assert_eq!(exported, 1);
         assert_eq!(dst.read_file(Path::new("README.md")).unwrap(), b"ok\n");
         assert!(dst.read_file(Path::new("secrets.env")).is_err());
