@@ -27,7 +27,7 @@ use crate::keys;
 use crate::to_io;
 use crate::trust::{self, Trust};
 use crate::watch;
-use crate::workspace::{CapWorkspace, Workspace};
+use crate::workspace::{CapWorkspace, Workspace, open_repo};
 
 use crate::EG_DIR;
 
@@ -761,8 +761,7 @@ pub fn status(dir: &Path, key: Option<&str>) -> io::Result<()> {
         for g in grants {
             let flags = trust::flags(g.perms);
             let flags = if flags.is_empty() { "none" } else { &flags };
-            let note = if g.revoked { " (revoked)" } else { "" };
-            println!("    {}  {flags}{note}", g.id);
+            println!("    {}  {flags}", g.id);
         }
     }
     Ok(())
@@ -788,26 +787,6 @@ fn count_tree(doc: &Doc) -> (usize, usize) {
     (files, dirs)
 }
 
-/// Grant `peer` access to this repo, writing it into `.eg/trust`.
-///
-/// `flags` is any of `pull` / `push`; empty means grant both. Re-running with
-/// `revoked`... is not how revocation works here, that is hand-edited or a later
-/// command; this only adds grants.
-pub fn trust(dir: &Path, peer: &str, perms: Perms) -> io::Result<()> {
-    let ws = open_repo(dir)?;
-    let id = EndpointId::from_str(peer).map_err(to_io)?;
-    trust::add(&ws, id, perms)?;
-    println!("eg trust: {id} may {}", trust::flags(perms));
-    Ok(())
-}
-
-/// Open `dir` as a confined workspace, creating it (and `.eg/`) if needed.
-pub(crate) fn open_repo(dir: &Path) -> io::Result<CapWorkspace> {
-    std::fs::create_dir_all(dir)?;
-    let ws = CapWorkspace::open(dir)?;
-    ws.create_dir(Path::new(EG_DIR))?;
-    Ok(ws)
-}
 
 #[cfg(test)]
 mod tests {

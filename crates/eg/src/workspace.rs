@@ -65,6 +65,14 @@ impl CapWorkspace {
     }
 }
 
+/// Open `dir` as a confined workspace, creating it (and `.eg/`) if needed.
+pub(crate) fn open_repo(dir: &Path) -> io::Result<CapWorkspace> {
+    std::fs::create_dir_all(dir)?;
+    let ws = CapWorkspace::open(dir)?;
+    ws.create_dir(Path::new(crate::EG_DIR))?;
+    Ok(ws)
+}
+
 impl Workspace for CapWorkspace {
     fn read_dir(&self, rel: &Path) -> io::Result<Vec<Entry>> {
         // cap-std has no notion of the root as a path, so list it via `entries`.

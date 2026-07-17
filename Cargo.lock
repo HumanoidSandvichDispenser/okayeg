@@ -937,6 +937,7 @@ dependencies = [
  "notify-debouncer-full",
  "okayeg",
  "okayeg-net",
+ "serde",
  "tempfile",
  "tokio",
  "toml",

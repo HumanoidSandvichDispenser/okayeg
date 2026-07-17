@@ -18,8 +18,6 @@ mod workspace;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use okayeg::Perms;
-
 /// Where a repo keeps its private state, hidden under the served directory:
 /// the node key now, the doc snapshot and trust set later. Never imported as
 /// doc content.
@@ -84,11 +82,10 @@ enum SharedCmd {
     Id,
     /// Show this repo's id, doc contents, and trust set.
     Status,
-    /// Grant a peer access (default both).
+    /// Manage which peers may sync this repo.
     Trust {
-        peer: String,
-        /// Any of `pull` / `push`; empty grants both.
-        access: Vec<Access>,
+        #[command(subcommand)]
+        action: trust::TrustAction,
     },
     /// Lists the files in the specified directory in the doc.
     Ls {
@@ -109,28 +106,10 @@ impl SharedCmd {
         match self {
             SharedCmd::Id => net::id(dir, key),
             SharedCmd::Status => net::status(dir, key),
-            SharedCmd::Trust { peer, access } => net::trust(dir, &peer, perms_from(&access)),
+            SharedCmd::Trust { action } => trust::perform_action(dir, action),
             SharedCmd::Ls { path } => filetree::ls_stdio(dir, &path),
             SharedCmd::Cat { paths } => filetree::cat_stdio(dir, &paths),
         }
-    }
-}
-
-/// A capability that can be granted to a peer with `eg trust`.
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum Access {
-    Pull,
-    Push,
-}
-
-/// Turn the requested access list into a [`Perms`]; empty means full access.
-fn perms_from(access: &[Access]) -> Perms {
-    if access.is_empty() {
-        return Perms::all();
-    }
-    Perms {
-        pull: access.contains(&Access::Pull),
-        push: access.contains(&Access::Push),
     }
 }
 
@@ -239,31 +218,5 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory as _;
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn perms_from_access_list() {
-        assert_eq!(perms_from(&[]), Perms::all());
-        assert_eq!(
-            perms_from(&[Access::Pull]),
-            Perms {
-                pull: true,
-                push: false
-            }
-        );
-        assert_eq!(
-            perms_from(&[Access::Push]),
-            Perms {
-                pull: false,
-                push: true
-            }
-        );
-        assert_eq!(
-            perms_from(&[Access::Push, Access::Pull, Access::Pull]),
-            Perms {
-                pull: true,
-                push: true
-            }
-        );
     }
 }
