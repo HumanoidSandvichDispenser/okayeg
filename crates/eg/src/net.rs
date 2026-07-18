@@ -108,8 +108,8 @@ fn local_identity(eff: &Effective, dir: &Path) -> Identity {
     };
 
     Identity {
-        name: field(&eff.name, "user.name"),
-        email: field(&eff.email, "user.email"),
+        name: field(&eff.identity.name, "user.name"),
+        email: field(&eff.identity.email, "user.email"),
     }
 }
 

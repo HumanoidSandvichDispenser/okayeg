@@ -53,6 +53,53 @@ const CONFIG_PATH: &str = ".eg/config.toml";
 /// The keyring name of the default key.
 pub const DEVICE_KEY: &str = "device";
 
+/// A coalescable configuration option.
+trait Coalesce {
+    fn coalesce(self, other: Self) -> Self;
+}
+
+impl<T> Coalesce for Option<T> {
+    fn coalesce(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
+/// The identity fields of a peer.
+#[derive(Default, Debug, PartialEq, Clone)]
+pub struct IdentityConfig {
+    /// The declared name of the peer.
+    pub name: Option<String>,
+
+    /// The declared email of the peer.
+    pub email: Option<String>,
+}
+
+impl Coalesce for IdentityConfig {
+    fn coalesce(self, other: Self) -> Self {
+        IdentityConfig {
+            name: self.name.coalesce(other.name),
+            email: self.email.coalesce(other.email),
+        }
+    }
+}
+
+impl IdentityConfig {
+    /// Parse the `[identity]` table out of `value`, all-defaults when absent.
+    /// `err` builds the scope-specific error.
+    fn parse(value: &toml::Table, err: fn(String) -> io::Error) -> io::Result<Self> {
+        let table = match value.get("identity") {
+            None => return Ok(Self::default()),
+            Some(v) => v
+                .as_table()
+                .ok_or_else(|| err("identity must be a table".to_owned()))?,
+        };
+        Ok(IdentityConfig {
+            name: string_in(table, "name", "identity.", err)?,
+            email: string_in(table, "email", "identity.", err)?,
+        })
+    }
+}
+
 /// The parsed config. A missing file parses as all-defaults.
 #[derive(Default, Debug, PartialEq)]
 pub struct Config {
@@ -60,13 +107,8 @@ pub struct Config {
     /// gates connections.
     pub authz_command: Option<Vec<String>>,
 
-    /// The `[identity] name` announced to peers. `None` when absent (git
-    /// config decides); `Some("")` keeps it blank.
-    pub name: Option<String>,
-
-    /// The `[identity] email` announced to peers, with the same fallback rule
-    /// as `name`.
-    pub email: Option<String>,
+    /// The `[identity]` block in this repo's config.
+    pub identity: IdentityConfig,
 
     /// The `[session] command` argv, program first. `None` means session
     /// events are not reported.
@@ -87,11 +129,8 @@ pub struct Config {
 /// The parsed global config. A missing file parses as all-defaults.
 #[derive(Default, Debug, PartialEq)]
 pub struct GlobalConfig {
-    /// The default `[identity] name`.
-    pub name: Option<String>,
-
-    /// The default `[identity] email`.
-    pub email: Option<String>,
+    /// The default `[identity]` block in the global config.
+    pub identity: IdentityConfig,
 
     /// The default key name.
     pub key: Option<String>,
@@ -122,11 +161,8 @@ pub struct Remote {
     /// The key used with this remote.
     pub key: Option<String>,
 
-    /// The `name` announced to peers on this remote.
-    pub name: Option<String>,
-
-    /// The `email` announced to peers on this remote.
-    pub email: Option<String>,
+    /// The identity announced to peers on this remote.
+    pub identity: IdentityConfig,
 }
 
 /// The key a command runs with.
@@ -143,11 +179,8 @@ pub enum KeySelector {
 /// The settings a command sees once every scope is merged.
 #[derive(Debug, PartialEq)]
 pub struct Effective {
-    /// The `name` announced to peers.
-    pub name: Option<String>,
-
-    /// The `email` announced to peers.
-    pub email: Option<String>,
+    /// The identity announced to peers.
+    pub identity: IdentityConfig,
 
     /// The selected key.
     pub key: KeySelector,
@@ -204,17 +237,14 @@ pub fn resolve(
         })
         .unwrap_or(KeySelector::Named(DEVICE_KEY.to_owned()));
 
-    let field = |repo: &Option<String>,
-                 remote_field: fn(&Remote) -> &Option<String>,
-                 global: &Option<String>| {
-        repo.clone()
-            .or_else(|| remote.and_then(|r| remote_field(r).clone()))
-            .or_else(|| global.clone())
-    };
+    let identity = repo
+        .identity
+        .clone()
+        .coalesce(remote.map(|r| r.identity.clone()).unwrap_or_default())
+        .coalesce(global.identity.clone());
 
     Ok(Effective {
-        name: field(&repo.name, |r| &r.name, &global.name),
-        email: field(&repo.email, |r| &r.email, &global.email),
+        identity,
         key,
         authz_command: repo.authz_command.clone(),
         session_command: repo.session_command.clone(),
@@ -279,20 +309,11 @@ impl Config {
         let authz_command = command_field("authz")?;
         let session_command = command_field("session")?;
 
-        let identity_field = |key: &str| match value.get("identity").and_then(|t| t.get(key)) {
-            None => Ok(None),
-            Some(v) => v
-                .as_str()
-                .map(|s| Some(s.to_owned()))
-                .ok_or_else(|| bad(format!("identity.{key} must be a string"))),
-        };
-        let name = identity_field("name")?;
-        let email = identity_field("email")?;
+        let identity = IdentityConfig::parse(&value, bad)?;
 
         Ok(Self {
             authz_command,
-            name,
-            email,
+            identity,
             session_command,
             remote,
             peer,
@@ -319,18 +340,7 @@ impl GlobalConfig {
 
         let key = string_in(&value, "key", "")?;
 
-        let (name, email) = match value.get("identity") {
-            None => (None, None),
-            Some(v) => {
-                let table = v
-                    .as_table()
-                    .ok_or_else(|| bad_global("identity must be a table"))?;
-                (
-                    string_in(table, "name", "identity.")?,
-                    string_in(table, "email", "identity.")?,
-                )
-            }
-        };
+        let identity = IdentityConfig::parse(&value, bad_global)?;
 
         let keys_backend = match value.get("keys").and_then(|t| t.get("backend")) {
             None => KeysBackend::default(),
@@ -360,16 +370,17 @@ impl GlobalConfig {
                     Remote {
                         peer: string_in(block, "peer", &at)?,
                         key: string_in(block, "key", &at)?,
-                        name: string_in(block, "name", &at)?,
-                        email: string_in(block, "email", &at)?,
+                        identity: IdentityConfig {
+                            name: string_in(block, "name", &at)?,
+                            email: string_in(block, "email", &at)?,
+                        },
                     },
                 );
             }
         }
 
         Ok(Self {
-            name,
-            email,
+            identity,
             key,
             keys_backend,
             remotes,
@@ -478,15 +489,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.key.as_deref(), Some("work"));
-        assert_eq!(config.name.as_deref(), Some("alice"));
-        assert_eq!(config.email.as_deref(), Some("a@b.c"));
+        assert_eq!(config.identity.name.as_deref(), Some("alice"));
+        assert_eq!(config.identity.email.as_deref(), Some("a@b.c"));
         assert_eq!(config.keys_backend, KeysBackend::SecretService);
 
         let remote = &config.remotes["thesis"];
         assert_eq!(remote.peer.as_deref(), Some("abcd"));
         assert_eq!(remote.key.as_deref(), Some("uni"));
-        assert_eq!(remote.name.as_deref(), Some("al"));
-        assert_eq!(remote.email, None);
+        assert_eq!(remote.identity.name.as_deref(), Some("al"));
+        assert_eq!(remote.identity.email, None);
     }
 
     #[test]
@@ -591,42 +602,50 @@ mod tests {
     #[test]
     fn identity_layers_repo_over_remote_over_global() {
         let mut global = GlobalConfig {
-            name: Some("global".to_owned()),
-            email: Some("global@x".to_owned()),
+            identity: IdentityConfig {
+                name: Some("global".to_owned()),
+                email: Some("global@x".to_owned()),
+            },
             ..GlobalConfig::default()
         };
         global.remotes.insert(
             "r".to_owned(),
             Remote {
-                name: Some("remote".to_owned()),
+                identity: IdentityConfig {
+                    name: Some("remote".to_owned()),
+                    ..IdentityConfig::default()
+                },
                 ..Remote::default()
             },
         );
         let repo = Config {
             remote: Some("r".to_owned()),
-            email: Some("".to_owned()),
+            identity: IdentityConfig {
+                email: Some("".to_owned()),
+                ..IdentityConfig::default()
+            },
             ..Config::default()
         };
 
         let resolved = resolve(None, None, &repo, &global, false).unwrap();
         // name: unset in repo, the remote block wins over global
-        assert_eq!(resolved.name.as_deref(), Some("remote"));
+        assert_eq!(resolved.identity.name.as_deref(), Some("remote"));
         // email: the repo's explicit blank shadows both lower layers
-        assert_eq!(resolved.email.as_deref(), Some(""));
+        assert_eq!(resolved.identity.email.as_deref(), Some(""));
 
         let repo = Config::default();
         let resolved = resolve(None, None, &repo, &global, false).unwrap();
-        assert_eq!(resolved.name.as_deref(), Some("global"));
+        assert_eq!(resolved.identity.name.as_deref(), Some("global"));
     }
 
     #[test]
     fn identity_distinguishes_absent_from_blank() {
         let config = Config::parse("[identity]\nname = \"alice\"\nemail = \"\"\n").unwrap();
-        assert_eq!(config.name.as_deref(), Some("alice"));
-        assert_eq!(config.email.as_deref(), Some(""));
+        assert_eq!(config.identity.name.as_deref(), Some("alice"));
+        assert_eq!(config.identity.email.as_deref(), Some(""));
 
         let config = Config::parse("").unwrap();
-        assert_eq!(config.name, None);
-        assert_eq!(config.email, None);
+        assert_eq!(config.identity.name, None);
+        assert_eq!(config.identity.email, None);
     }
 }
