@@ -47,6 +47,8 @@ struct Identity {
     name: Option<String>,
 
     email: Option<String>,
+
+    color: Option<String>,
 }
 
 /// Wire this node's presence: set its own entry under `key`, feed local
@@ -85,8 +87,8 @@ fn wire_presence(
     sub
 }
 
-/// The presence entry for `identity`: its name and email as a map, unset
-/// fields left out.
+/// The presence entry for `identity`: its name, email, and color as a map,
+/// unset fields left out.
 fn presence_value(identity: &Identity) -> LoroValue {
     let mut map = std::collections::HashMap::new();
     if let Some(name) = &identity.name {
@@ -95,12 +97,15 @@ fn presence_value(identity: &Identity) -> LoroValue {
     if let Some(email) = &identity.email {
         map.insert("email".to_string(), LoroValue::from(email.as_str()));
     }
+    if let Some(color) = &identity.color {
+        map.insert("color".to_string(), LoroValue::from(color.as_str()));
+    }
     LoroValue::from(map)
 }
 
 /// The identity announced in this repo's presence entry: `[identity]` from the
-/// config, falling back per field to git config for anything unset. An empty
-/// string in the config keeps the field blank.
+/// config. `name` and `email` fall back to git config when unset; an empty
+/// string in the config keeps the field blank. `color` has no git fallback.
 fn local_identity(eff: &Effective, dir: &Path) -> Identity {
     let field = |set: &Option<String>, key: &str| match set {
         Some(s) => (!s.is_empty()).then(|| s.clone()),
@@ -110,6 +115,7 @@ fn local_identity(eff: &Effective, dir: &Path) -> Identity {
     Identity {
         name: field(&eff.identity.name, "user.name"),
         email: field(&eff.identity.email, "user.email"),
+        color: eff.identity.color.clone(),
     }
 }
 
@@ -192,6 +198,7 @@ fn presence_identity(presence: &Presence, who: &EndpointId) -> Identity {
     Identity {
         name: text("name"),
         email: text("email"),
+        color: text("color"),
     }
 }
 

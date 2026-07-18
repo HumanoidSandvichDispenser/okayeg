@@ -10,12 +10,13 @@
 //! [identity]
 //! name = "alice"
 //! email = "alice@example.com"
+//! color = "#ff8800"
 //! ```
 //!
-//! `identity` is the name and email shared with peers in this repo's presence
-//! entry, like `git config user.name`. Self-asserted; it grants nothing. A key
-//! that is absent falls back to the same key in git config; a key set to `""`
-//! stays blank instead.
+//! `identity` is the name, email, and cursor color shared with peers in this
+//! repo's presence entry, like `git config user.name`. Self-asserted; it grants
+//! nothing. A key that is absent falls back to the same key in git config; a key
+//! set to `""` stays blank instead. `color` is a `#rrggbb` hex string.
 //!
 //! ```toml
 //! [session]
@@ -72,18 +73,29 @@ pub struct IdentityConfig {
 
     /// The declared email of the peer.
     pub email: Option<String>,
-}
 
-impl Coalesce for IdentityConfig {
-    fn coalesce(self, other: Self) -> Self {
-        IdentityConfig {
-            name: self.name.coalesce(other.name),
-            email: self.email.coalesce(other.email),
-        }
-    }
+    /// The declared cursor color of the peer, as `#rrggbb`.
+    pub color: Option<String>,
 }
 
 impl IdentityConfig {
+    /// The effective identity from `layers`, highest priority first. `name` and
+    /// `email` take the first set value; `color` takes the first that validates,
+    /// warning past any malformed higher-priority values.
+    fn layer(layers: impl IntoIterator<Item = Self>) -> Self {
+        let (mut name, mut email, mut colors) = (None, None, Vec::new());
+        for l in layers {
+            name = name.coalesce(l.name);
+            email = email.coalesce(l.email);
+            colors.extend(l.color);
+        }
+        IdentityConfig {
+            name,
+            email,
+            color: first_valid(colors, normalize_color),
+        }
+    }
+
     /// Parse the `[identity]` table out of `value`, all-defaults when absent.
     /// `err` builds the scope-specific error.
     fn parse(value: &toml::Table, err: fn(String) -> io::Error) -> io::Result<Self> {
@@ -96,6 +108,7 @@ impl IdentityConfig {
         Ok(IdentityConfig {
             name: string_in(table, "name", "identity.", err)?,
             email: string_in(table, "email", "identity.", err)?,
+            color: string_in(table, "color", "identity.", err)?,
         })
     }
 }
@@ -237,11 +250,11 @@ pub fn resolve(
         })
         .unwrap_or(KeySelector::Named(DEVICE_KEY.to_owned()));
 
-    let identity = repo
-        .identity
-        .clone()
-        .coalesce(remote.map(|r| r.identity.clone()).unwrap_or_default())
-        .coalesce(global.identity.clone());
+    let identity = IdentityConfig::layer([
+        repo.identity.clone(),
+        remote.map(|r| r.identity.clone()).unwrap_or_default(),
+        global.identity.clone(),
+    ]);
 
     Ok(Effective {
         identity,
@@ -373,6 +386,7 @@ impl GlobalConfig {
                         identity: IdentityConfig {
                             name: string_in(block, "name", &at)?,
                             email: string_in(block, "email", &at)?,
+                            color: string_in(block, "color", &at)?,
                         },
                     },
                 );
@@ -414,6 +428,58 @@ fn bad(msg: impl std::fmt::Display) -> io::Error {
 
 fn bad_global(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("eg config.toml: {msg}"))
+}
+
+/// Returns the first valid value from the iterator, or `None` if all are either `None` or `Err`.
+fn first_valid<T, E: std::fmt::Debug>(
+    values: impl IntoIterator<Item = String>,
+    validator: impl Fn(&str) -> Result<T, E>,
+) -> Option<T> {
+    values.into_iter().find_map(|c| validator(&c)
+        .map_err(|e| eprintln!("warning: ignoring malformed value: {e:?}"))
+        .ok())
+}
+
+#[derive(Debug)]
+pub enum ColorParseError {
+    WrongLength,
+    NonAscii,
+    NotHex,
+}
+
+impl From<ColorParseError> for io::Error {
+    fn from(color: ColorParseError) -> Self {
+        match color {
+            ColorParseError::WrongLength => bad("identity.color must be a 6-digit hex string"),
+            ColorParseError::NonAscii | ColorParseError::NotHex => {
+                bad("identity.color must be a valid hex string, e.g. #ff8800")
+            },
+        }
+    }
+}
+
+fn normalize_color(hex_color: &str) -> Result<String, ColorParseError> {
+    let hex_color = hex_color
+        .strip_prefix('#')
+        .unwrap_or(hex_color);
+
+    if hex_color.len() != 6 {
+        return Err(ColorParseError::WrongLength);
+    }
+
+    if !hex_color.is_ascii() {
+        return Err(ColorParseError::NonAscii);
+    }
+
+    let r_str = hex_color.get(0..2).expect("slice should be valid");
+    let g_str = hex_color.get(2..4).expect("slice should be valid");
+    let b_str = hex_color.get(4..6).expect("slice should be valid");
+
+    let r = u8::from_str_radix(r_str, 16).map_err(|_| ColorParseError::NotHex)?;
+    let g = u8::from_str_radix(g_str, 16).map_err(|_| ColorParseError::NotHex)?;
+    let b = u8::from_str_radix(b_str, 16).map_err(|_| ColorParseError::NotHex)?;
+
+    Ok(format!("#{:02x}{:02x}{:02x}", r, g, b))
 }
 
 #[cfg(test)]
@@ -605,6 +671,7 @@ mod tests {
             identity: IdentityConfig {
                 name: Some("global".to_owned()),
                 email: Some("global@x".to_owned()),
+                ..IdentityConfig::default()
             },
             ..GlobalConfig::default()
         };
@@ -647,5 +714,48 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert_eq!(config.identity.name, None);
         assert_eq!(config.identity.email, None);
+    }
+
+    #[test]
+    fn color_normalizes_and_accepts_hash_and_case() {
+        let id = |s: &str| Config::parse(s).unwrap().identity.color;
+        // the winner is normalized to lowercase #rrggbb, with or without the '#'
+        assert_eq!(
+            IdentityConfig::layer([Config::parse("[identity]\ncolor = \"#FF8800\"\n")
+                .unwrap()
+                .identity])
+            .color
+            .as_deref(),
+            Some("#ff8800")
+        );
+        // raw parse keeps the string; validation happens at layer time
+        assert_eq!(id("[identity]\ncolor = \"ff8800\"\n").as_deref(), Some("ff8800"));
+    }
+
+    #[test]
+    fn color_falls_through_malformed_layers_to_first_valid() {
+        // repo malformed, remote valid -> remote wins (repo's bad value skipped)
+        let repo = IdentityConfig {
+            color: Some("zzz".to_owned()),
+            ..Default::default()
+        };
+        let remote = IdentityConfig {
+            color: Some("#00ff00".to_owned()),
+            ..Default::default()
+        };
+        let global = IdentityConfig {
+            color: Some("#0000ff".to_owned()),
+            ..Default::default()
+        };
+        let resolved = IdentityConfig::layer([repo, remote, global]);
+        assert_eq!(resolved.color.as_deref(), Some("#00ff00"));
+
+        // all malformed -> None
+        let bad = |s: &str| IdentityConfig {
+            color: Some(s.to_owned()),
+            ..Default::default()
+        };
+        let resolved = IdentityConfig::layer([bad("zzz"), bad("#12345"), bad("nope")]);
+        assert_eq!(resolved.color, None);
     }
 }
