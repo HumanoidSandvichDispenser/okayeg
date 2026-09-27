@@ -82,6 +82,9 @@ pub fn mount(target: &str, mountpoint: &Path, cli_key: Option<&str>) -> io::Resu
     std::fs::create_dir_all(&state_dir)?;
     let state = std::rc::Rc::new(CapWorkspace::open(&state_dir)?);
 
+    // attempt to obtain lock and hold it for the mount's lifetime
+    let _lock = state.lock_state()?;
+
     let repo = Config {
         remote: remote_name,
         ..Config::default()

@@ -11,9 +11,9 @@ copy.
 
 ## Building
 
-Needs Rust 1.85 or newer (edition 2024). The `eg mount` command needs FUSE
-(`fuse3` on Linux). Right now FUSE only works as a read-only mount. In the
-future, it will support writing to the mount as well.
+Needs Rust 1.89 or newer. The `eg mount` command needs FUSE (`fuse3` on Linux).
+Right now FUSE only works as a read-only mount. In the future, it will support
+writing to the mount as well.
 
 ```sh
 cargo build --release

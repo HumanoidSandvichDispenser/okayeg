@@ -435,9 +435,11 @@ fn first_valid<T, E: std::fmt::Debug>(
     values: impl IntoIterator<Item = String>,
     validator: impl Fn(&str) -> Result<T, E>,
 ) -> Option<T> {
-    values.into_iter().find_map(|c| validator(&c)
-        .map_err(|e| eprintln!("warning: ignoring malformed value: {e:?}"))
-        .ok())
+    values.into_iter().find_map(|c| {
+        validator(&c)
+            .map_err(|e| eprintln!("warning: ignoring malformed value: {e:?}"))
+            .ok()
+    })
 }
 
 #[derive(Debug)]
@@ -453,15 +455,13 @@ impl From<ColorParseError> for io::Error {
             ColorParseError::WrongLength => bad("identity.color must be a 6-digit hex string"),
             ColorParseError::NonAscii | ColorParseError::NotHex => {
                 bad("identity.color must be a valid hex string, e.g. #ff8800")
-            },
+            }
         }
     }
 }
 
 fn normalize_color(hex_color: &str) -> Result<String, ColorParseError> {
-    let hex_color = hex_color
-        .strip_prefix('#')
-        .unwrap_or(hex_color);
+    let hex_color = hex_color.strip_prefix('#').unwrap_or(hex_color);
 
     if hex_color.len() != 6 {
         return Err(ColorParseError::WrongLength);
@@ -729,7 +729,10 @@ mod tests {
             Some("#ff8800")
         );
         // raw parse keeps the string; validation happens at layer time
-        assert_eq!(id("[identity]\ncolor = \"ff8800\"\n").as_deref(), Some("ff8800"));
+        assert_eq!(
+            id("[identity]\ncolor = \"ff8800\"\n").as_deref(),
+            Some("ff8800")
+        );
     }
 
     #[test]

@@ -151,9 +151,8 @@ impl Trust {
     /// default for a fresh repo.
     pub fn load(ws: &dyn Workspace) -> io::Result<Self> {
         let text = match ws.read_file(Path::new(TRUST_PATH)) {
-            Ok(bytes) => {
-                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            }
+            Ok(bytes) => String::from_utf8(bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };

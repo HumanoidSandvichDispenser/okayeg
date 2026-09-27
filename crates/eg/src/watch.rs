@@ -205,9 +205,7 @@ fn prune(
                 dirs.remove(&rel);
             }
             Ok(Some(Kind::Dir)) => {
-                if ws
-                    .read_dir(&rel)
-                    .is_ok_and(|entries| entries.is_empty())
+                if ws.read_dir(&rel).is_ok_and(|entries| entries.is_empty())
                     && ws.remove_dir(&rel).is_ok()
                 {
                     dirs.remove(&rel);
@@ -612,7 +610,10 @@ mod tests {
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("x.txt"),
-            ExportedBase { frontier: base, node },
+            ExportedBase {
+                frontier: base,
+                node,
+            },
         );
         let mut dirs = ExportDirs::new();
 
@@ -646,7 +647,10 @@ mod tests {
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("x.txt"),
-            ExportedBase { frontier: base, node },
+            ExportedBase {
+                frontier: base,
+                node,
+            },
         );
 
         peer_deletes(&doc, node);
@@ -660,7 +664,10 @@ mod tests {
             b"hello edited",
             "edit-raced file should be kept"
         );
-        assert!(bases.contains_key(Path::new("x.txt")), "base should be kept");
+        assert!(
+            bases.contains_key(Path::new("x.txt")),
+            "base should be kept"
+        );
     }
 
     #[test]
@@ -678,7 +685,10 @@ mod tests {
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("x.txt"),
-            ExportedBase { frontier: doc.frontiers(), node },
+            ExportedBase {
+                frontier: doc.frontiers(),
+                node,
+            },
         );
 
         export_and_prune(&doc, &ws, &mut bases, &mut ExportDirs::new());
@@ -702,11 +712,15 @@ mod tests {
         let base = doc.frontiers();
 
         ws.create_dir(Path::new("src")).unwrap();
-        ws.write_file(Path::new("src/main.rs"), b"fn main()").unwrap();
+        ws.write_file(Path::new("src/main.rs"), b"fn main()")
+            .unwrap();
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("src/main.rs"),
-            ExportedBase { frontier: base.clone(), node: file },
+            ExportedBase {
+                frontier: base.clone(),
+                node: file,
+            },
         );
         let mut dirs = ExportDirs::new();
         dirs.insert(PathBuf::from("src"));
@@ -717,8 +731,14 @@ mod tests {
 
         export_and_prune(&doc, &ws, &mut bases, &mut dirs);
 
-        assert!(ws.read_file(Path::new("src/main.rs")).is_err(), "stale child kept");
-        assert!(ws.kind(Path::new("src")).unwrap() != Some(Kind::Dir), "empty dir kept");
+        assert!(
+            ws.read_file(Path::new("src/main.rs")).is_err(),
+            "stale child kept"
+        );
+        assert!(
+            ws.kind(Path::new("src")).unwrap() != Some(Kind::Dir),
+            "empty dir kept"
+        );
         assert!(!bases.contains_key(Path::new("src/main.rs")));
         assert!(!dirs.contains(Path::new("src")));
     }
@@ -770,7 +790,10 @@ mod tests {
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("a.txt"),
-            ExportedBase { frontier: base, node },
+            ExportedBase {
+                frontier: base,
+                node,
+            },
         );
 
         peer_renames(&doc, node, "b.txt");
@@ -849,7 +872,10 @@ mod tests {
         let mut bases = FileBases::new();
         bases.insert(
             PathBuf::from("x.txt"),
-            ExportedBase { frontier: base, node },
+            ExportedBase {
+                frontier: base,
+                node,
+            },
         );
 
         // Prune would remove the file, but exercise the fallback directly:

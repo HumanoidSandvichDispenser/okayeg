@@ -6,6 +6,7 @@
 //! operation at the syscall layer with cap-std. Tests use [`MemWorkspace`], an
 //! in-memory tree with no disk and no symlinks.
 
+use std::fs::TryLockError;
 use std::io;
 use std::path::Path;
 
@@ -13,6 +14,8 @@ use std::path::Path;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::PathBuf;
+
+use cap_std::fs::OpenOptionsExt;
 
 /// Whether a path is a file or a directory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,6 +65,56 @@ impl CapWorkspace {
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
         Ok(Self { dir })
+    }
+
+    /// Hold the lockfile for the lifetime of the returned file.
+    ///
+    /// This creates a file `mount.lock` in the workspace root and tries to acquire an exclusive
+    /// lock on it. This is intended for FUSE mounts which have their own data directory.
+    ///
+    /// This prevents multiple processes from mounting the same repo more than once. If the lock
+    /// cannot be acquired, returns an error with the PID of the process holding the lock.
+    pub fn lock_state(&self) -> io::Result<std::fs::File> {
+        let lock_file_path = "mount.lock";
+
+        let file = self
+            .dir
+            .open_with(
+                lock_file_path,
+                cap_std::fs::OpenOptions::new()
+                    .mode(0o600)
+                    .read(true)
+                    .write(true)
+                    .create(true),
+            )?
+            .into_std();
+
+        // try to capture lock on the file, if it fails, return an error. if it would block, then
+        // something else has the lock and we should return an error
+        match file.try_lock() {
+            Ok(_) => {
+                // write pid
+                let pid = std::process::id();
+                self.dir.write(lock_file_path, pid.to_string())?;
+
+                Ok(file)
+            }
+            Err(TryLockError::WouldBlock) => Err(io::Error::other(
+                // process holding lock will write its own PID to the lock file, so we can read it
+                // and include it in the error message
+                format!(
+                    "failed to acquire lock: {}",
+                    self.dir
+                        .read_to_string(lock_file_path)
+                        .map(|s| format!("another process (PID {}) is holding the lock", s.trim()))
+                        .unwrap_or_else(|_| "another process is holding the lock".to_string())
+                ),
+            )),
+            Err(TryLockError::Error(e)) => Err(io::Error::new(
+                e.kind(),
+                format!("failed to acquire lock: {}", e),
+            )),
+        }
     }
 }
 
@@ -246,7 +299,10 @@ impl Workspace for MemWorkspace {
         if self.files.borrow_mut().remove(rel).is_some() {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, rel.display().to_string()))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                rel.display().to_string(),
+            ))
         }
     }
 
@@ -255,9 +311,7 @@ impl Workspace for MemWorkspace {
         let rel = rel.to_path_buf();
         let files = self.files.borrow();
         let dirs = self.dirs.borrow();
-        let occupied = files
-            .keys()
-            .any(|p| p.starts_with(&rel) && *p != rel)
+        let occupied = files.keys().any(|p| p.starts_with(&rel) && *p != rel)
             || dirs.iter().any(|p| p.starts_with(&rel) && *p != rel);
         if occupied {
             return Err(io::Error::new(
@@ -271,7 +325,10 @@ impl Workspace for MemWorkspace {
         if was {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, rel.display().to_string()))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                rel.display().to_string(),
+            ))
         }
     }
 
@@ -316,5 +373,34 @@ mod tests {
         // A symlink inside the root pointing outside it does not let reads through.
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         assert!(ws.read_file(Path::new("link/secret")).is_err());
+    }
+
+    #[test]
+    fn cap_workspace_lockfile_should_error_when_acquired() {
+        let root = tempfile::tempdir().unwrap();
+        let ws1 = CapWorkspace::open(root.path()).unwrap();
+        let _lock1 = ws1.lock_state().unwrap();
+
+        let ws2 = CapWorkspace::open(root.path()).unwrap();
+        let lock2_result = ws2.lock_state();
+
+        let pid = std::process::id().to_string();
+
+        assert!(lock2_result.is_err());
+        assert!(lock2_result.unwrap_err().to_string().contains(&pid));
+    }
+
+    #[test]
+    fn cap_workspace_lockfile_should_succeed_when_lock_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let ws1 = CapWorkspace::open(root.path()).unwrap();
+        let lock1 = ws1.lock_state().unwrap();
+
+        let ws2 = CapWorkspace::open(root.path()).unwrap();
+
+        drop(lock1);
+        let lock2_result = ws2.lock_state();
+
+        assert!(lock2_result.is_ok());
     }
 }

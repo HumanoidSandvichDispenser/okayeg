@@ -599,8 +599,16 @@ mod client {
             };
             let obj = Object::new();
             let _ = Reflect::set(&obj, &"file".into(), &JsValue::from_str(&file));
-            let _ = Reflect::set(&obj, &"anchor".into(), &JsValue::from_f64(a.current.pos as f64));
-            let _ = Reflect::set(&obj, &"head".into(), &JsValue::from_f64(h.current.pos as f64));
+            let _ = Reflect::set(
+                &obj,
+                &"anchor".into(),
+                &JsValue::from_f64(a.current.pos as f64),
+            );
+            let _ = Reflect::set(
+                &obj,
+                &"head".into(),
+                &JsValue::from_f64(h.current.pos as f64),
+            );
             let orphaned = a.update.is_some() || h.update.is_some();
             let _ = Reflect::set(&obj, &"orphaned".into(), &JsValue::from_bool(orphaned));
             let _ = Reflect::set(&out, &JsValue::from_str(&ns), &obj);

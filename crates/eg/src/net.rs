@@ -287,7 +287,13 @@ fn export_and_prune(
     mut dir_bases: watch::ExportDirs,
 ) -> io::Result<usize> {
     let plan = store(doc, ws)?;
-    Ok(watch::advance_and_prune(doc, ws, plan, &mut bases, &mut dir_bases))
+    Ok(watch::advance_and_prune(
+        doc,
+        ws,
+        plan,
+        &mut bases,
+        &mut dir_bases,
+    ))
 }
 
 /// Serve `dir` over iroh: watch local edits into the doc and sync every peer
@@ -793,7 +799,6 @@ fn count_tree(doc: &Doc) -> (usize, usize) {
     }
     (files, dirs)
 }
-
 
 #[cfg(test)]
 mod tests {
