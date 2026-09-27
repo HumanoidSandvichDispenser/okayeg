@@ -34,6 +34,7 @@ pub fn offset_to_line_col(text: &str, offset: usize) -> Option<(usize, usize)> {
 
 /// The code-point offset of 1-based `line` and `col` in `text`, or `None` when
 /// that position does not exist.
+#[allow(unused)]
 pub fn line_col_to_offset(text: &str, line: usize, col: usize) -> Option<usize> {
     if line == 0 || col == 0 {
         return None;
