@@ -5,6 +5,7 @@
 //! [`net`] syncs over iroh, and [`watch`] tracks live edits.
 
 mod bridge;
+mod comment;
 mod config;
 mod filetree;
 mod ignore;
@@ -98,6 +99,11 @@ enum SharedCmd {
         /// The paths to print, relative to the doc root.
         paths: Vec<String>,
     },
+    /// List all comments in the doc, with their paths and authors.
+    Comment {
+        #[command(subcommand)]
+        action: comment::CommentAction,
+    },
 }
 
 impl SharedCmd {
@@ -109,6 +115,7 @@ impl SharedCmd {
             SharedCmd::Trust { action } => trust::perform_action(dir, action),
             SharedCmd::Ls { path } => filetree::ls_stdio(dir, &path),
             SharedCmd::Cat { paths } => filetree::cat_stdio(dir, &paths),
+            SharedCmd::Comment { action } => comment::handle_comment_action(dir, action),
         }
     }
 }

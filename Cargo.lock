@@ -933,6 +933,7 @@ dependencies = [
  "clap",
  "fuser",
  "ignore",
+ "loro",
  "notify",
  "notify-debouncer-full",
  "okayeg",
