@@ -1,9 +1,9 @@
-use std::path::Path;
 use loro::{LoroValue, ToJson};
+use std::path::Path;
 
 use clap::Subcommand;
 
-use crate::{net::load_doc, workspace::{CapWorkspace, open_repo}};
+use crate::net::load_doc;
 
 #[derive(Subcommand)]
 pub enum CommentAction {
@@ -72,9 +72,7 @@ pub fn handle_comment_action(dir: &Path, action: CommentAction) -> std::io::Resu
         CommentAction::List { file } => {
             // if file is specified, find the Loro TreeID associated with it and list comments for
             // that TreeID, otherwise list all comments
-            let tree_id = file
-                .as_ref()
-                .and_then(|f| doc.fs().resolve(f).ok());
+            let tree_id = file.as_ref().and_then(|f| doc.fs().resolve(f).ok());
 
             let comments = doc.comments().list(tree_id);
 
@@ -86,35 +84,39 @@ pub fn handle_comment_action(dir: &Path, action: CommentAction) -> std::io::Resu
 
                 // TODO: can probably format the comments better and also group by thread to show
                 // replies, which show <unknown> currently
-                let range_fmt = comment.range
+                let range_fmt = comment
+                    .range
                     .map(|r| {
-                        let start = offset_to_line_col(&doc.fs().read(&filename).unwrap_or_default(), r.start)
-                            .map(|(line, col)| format!("{}.{}", line, col))
-                            .unwrap_or_else(|| r.start.to_string());
+                        let start = offset_to_line_col(
+                            &doc.fs().read(&filename).unwrap_or_default(),
+                            r.start,
+                        )
+                        .map(|(line, col)| format!("{}.{}", line, col))
+                        .unwrap_or_else(|| r.start.to_string());
 
                         if r.start == r.end {
                             format!(":{}", start)
                         } else {
-                            let end = offset_to_line_col(&doc.fs().read(&filename).unwrap_or_default(), r.end)
-                                .map(|(line, col)| format!("{}.{}", line, col))
-                                .unwrap_or_else(|| r.end.to_string());
+                            let end = offset_to_line_col(
+                                &doc.fs().read(&filename).unwrap_or_default(),
+                                r.end,
+                            )
+                            .map(|(line, col)| format!("{}.{}", line, col))
+                            .unwrap_or_else(|| r.end.to_string());
 
                             format!(":{}-{}", start, end)
                         }
                     })
                     .unwrap_or_else(|| "".to_string());
 
-                let fields = comment
-                    .fields
-                    .iter()
-                    .map(|(k, v)| {
-                        let value_str: String = match v {
-                            LoroValue::String(s) => s.to_string(),
-                            _ => v.to_json_value().to_string(),
-                        };
+                let fields = comment.fields.iter().map(|(k, v)| {
+                    let value_str: String = match v {
+                        LoroValue::String(s) => s.to_string(),
+                        _ => v.to_json_value().to_string(),
+                    };
 
-                        format!("\t{}: {}", k, value_str)
-                    });
+                    format!("\t{}: {}", k, value_str)
+                });
 
                 println!("Comment {} @ {}{}", comment.id, filename, range_fmt);
                 println!("{}", fields.collect::<Vec<_>>().join("\n"));
@@ -125,6 +127,7 @@ pub fn handle_comment_action(dir: &Path, action: CommentAction) -> std::io::Resu
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

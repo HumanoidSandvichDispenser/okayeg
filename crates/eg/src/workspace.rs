@@ -152,10 +152,10 @@ impl Workspace for CapWorkspace {
     }
 
     fn write_file(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.dir.create_dir_all(parent)?;
-            }
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir.create_dir_all(parent)?;
         }
         self.dir.write(rel, contents)
     }
@@ -163,10 +163,10 @@ impl Workspace for CapWorkspace {
     fn write_private(&self, rel: &Path, contents: &[u8]) -> io::Result<()> {
         use cap_std::fs::{OpenOptions, OpenOptionsExt};
         use std::os::unix::fs::PermissionsExt;
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.dir.create_dir_all(parent)?;
-            }
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir.create_dir_all(parent)?;
         }
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(0o600);

@@ -312,10 +312,11 @@ pub fn watch(dir: &Path, out: &Path) -> std::io::Result<()> {
                 if snapshot_path.as_deref() == Some(path.as_path()) {
                     continue; // our own snapshot write
                 }
-                if let Ok(rel) = path.strip_prefix(&base) {
-                    if !rel.as_os_str().is_empty() && !changed.contains(&rel.to_path_buf()) {
-                        changed.push(rel.to_path_buf());
-                    }
+                if let Ok(rel) = path.strip_prefix(&base)
+                    && !rel.as_os_str().is_empty()
+                    && !changed.contains(&rel.to_path_buf())
+                {
+                    changed.push(rel.to_path_buf());
                 }
             }
         }

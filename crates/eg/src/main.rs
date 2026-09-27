@@ -161,16 +161,16 @@ where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
     let start = abs(cdir)?;
-    if let Some(root) = enclosing_repo(&start) {
-        if root != start {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "inside the repo at {}; clone into a fresh directory",
-                    root.display()
-                ),
-            ));
-        }
+    if let Some(root) = enclosing_repo(&start)
+        && root != start
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "inside the repo at {}; clone into a fresh directory",
+                root.display()
+            ),
+        ));
     }
     f(&start)
 }
