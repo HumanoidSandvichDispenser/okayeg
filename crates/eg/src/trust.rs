@@ -28,6 +28,7 @@ use crate::workspace::{Workspace, open_repo};
 const TRUST_PATH: &str = ".eg/trust";
 
 /// The trust set: who this repo will sync with, and what each may do.
+#[derive(Default)]
 pub struct Trust {
     peers: HashMap<EndpointId, GrantData>,
 }
@@ -147,8 +148,8 @@ struct Row {
 }
 
 impl Trust {
-    /// Load the trust set. A missing file means "trust no one", the secure
-    /// default for a fresh repo.
+    /// Load the trust set from the workspace's `.eg/trust`. A missing file is treated as an empty
+    /// trust set, while malformed files result in an error.
     pub fn load(ws: &dyn Workspace) -> io::Result<Self> {
         let text = match ws.read_file(Path::new(TRUST_PATH)) {
             Ok(bytes) => String::from_utf8(bytes)
@@ -156,9 +157,12 @@ impl Trust {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
+
         let file: TrustFile = toml::from_str(&text)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(".eg/trust: {e}")))?;
+
         let mut peers = HashMap::new();
+
         for (id_str, row) in file.peers {
             let id = EndpointId::from_str(&id_str).map_err(|e| {
                 io::Error::new(
@@ -166,6 +170,7 @@ impl Trust {
                     format!(".eg/trust: bad endpoint id {id_str:?}: {e}"),
                 )
             })?;
+
             peers.insert(
                 id,
                 GrantData {
@@ -177,6 +182,7 @@ impl Trust {
                 },
             );
         }
+
         Ok(Self { peers })
     }
 
@@ -197,6 +203,7 @@ impl Trust {
                 )
             })
             .collect();
+
         let text = toml::to_string_pretty(&TrustFile { peers }).map_err(to_io)?;
         ws.write_private(Path::new(TRUST_PATH), text.as_bytes())
     }
@@ -270,10 +277,15 @@ pub fn flags(perms: Perms) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::MemWorkspace;
 
     #[test]
-    fn perms_from_access_list() {
+    fn empty_access_list_grants_all_perms() {
         assert_eq!(perms_from(&[]), Perms::all());
+    }
+
+    #[test]
+    fn pull_access_only_grants_pull_perm() {
         assert_eq!(
             perms_from(&[Access::Pull]),
             Perms {
@@ -281,6 +293,10 @@ mod tests {
                 push: false
             }
         );
+    }
+
+    #[test]
+    fn push_access_only_grants_push_perm() {
         assert_eq!(
             perms_from(&[Access::Push]),
             Perms {
@@ -288,6 +304,21 @@ mod tests {
                 push: true
             }
         );
+    }
+
+    #[test]
+    fn pull_and_push_access_grants_both_perms() {
+        assert_eq!(
+            perms_from(&[Access::Pull, Access::Push]),
+            Perms {
+                pull: true,
+                push: true
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_access_list_should_merge() {
         assert_eq!(
             perms_from(&[Access::Push, Access::Pull, Access::Pull]),
             Perms {
@@ -295,5 +326,283 @@ mod tests {
                 push: true
             }
         );
+    }
+
+    #[test]
+    fn given_missing_file_when_load_then_return_empty_trust_set() {
+        let ws = MemWorkspace::new();
+
+        let trust = Trust::load(&ws).unwrap();
+
+        let grants = trust.grants();
+        assert_eq!(grants.len(), 0);
+    }
+
+    #[test]
+    fn given_valid_file_when_load_then_return_trust_set() {
+        let ws = MemWorkspace::new();
+        const TRUST_FILE: &str = r#"
+            [peers."0000000000000000000000000000000000000000000000000000000000000000"]
+            pull = true
+            push = false
+        "#;
+        ws.write_file(Path::new(TRUST_PATH), TRUST_FILE.as_bytes())
+            .unwrap();
+
+        let endpoint_id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+
+        let trust = Trust::load(&ws).unwrap();
+        assert_eq!(
+            trust.perms(endpoint_id),
+            Some(Perms {
+                pull: true,
+                push: false
+            })
+        );
+    }
+
+    #[test]
+    fn given_malformed_toml_when_load_then_throw_invaliddata() {
+        let ws = MemWorkspace::new();
+        const TRUST_FILE: &str = r#"
+            [forsen
+        "#;
+        ws.write_file(Path::new(TRUST_PATH), TRUST_FILE.as_bytes())
+            .unwrap();
+
+        let trust = Trust::load(&ws);
+        assert_eq!(
+            trust.err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn given_bad_endpoint_id_when_load_then_throw_invaliddata() {
+        let ws = MemWorkspace::new();
+        const TRUST_FILE: &str = r#"
+            [peers."not-a-valid-id"]
+            pull = true
+            push = false
+        "#;
+        ws.write_file(Path::new(TRUST_PATH), TRUST_FILE.as_bytes())
+            .unwrap();
+
+        let trust = Trust::load(&ws);
+        assert_eq!(
+            trust.err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn given_duplicate_endpoint_id_when_load_then_invaliddata() {
+        let ws = MemWorkspace::new();
+        const TRUST_FILE: &str = r#"
+            [peers."0000000000000000000000000000000000000000000000000000000000000000"]
+            pull = true
+            push = false
+
+            [peers."0000000000000000000000000000000000000000000000000000000000000000"]
+            pull = false
+            push = true
+        "#;
+
+        ws.write_file(Path::new(TRUST_PATH), TRUST_FILE.as_bytes())
+            .unwrap();
+
+        let trust = Trust::load(&ws);
+        assert_eq!(
+            trust.err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn given_invalid_utf8_in_file_when_load_then_invaliddata() {
+        let ws = MemWorkspace::new();
+        ws.write_file(Path::new(TRUST_PATH), &[0xff, 0xfe, 0xfd])
+            .unwrap();
+
+        let trust = Trust::load(&ws);
+        assert_eq!(
+            trust.err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn trust_perms_should_return_none_for_unknown_id() {
+        let trust = Trust::default();
+
+        assert!(
+            trust
+                .perms(EndpointId::from_bytes(&[0u8; 32]).unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn given_row_without_push_or_pull_when_perms_then_return_none() {
+        let ws = MemWorkspace::new();
+        const TRUST_FILE: &str = r#"
+            [peers."0000000000000000000000000000000000000000000000000000000000000000"]
+            pull = false
+            push = false
+        "#;
+        ws.write_file(Path::new(TRUST_PATH), TRUST_FILE.as_bytes())
+            .unwrap();
+
+        let trust = Trust::load(&ws).unwrap();
+        let perms = trust.perms(EndpointId::from_bytes(&[0u8; 32]).unwrap());
+
+        assert!(perms.is_none());
+    }
+
+    #[test]
+    fn dropping_one_perm_should_keep_the_other() {
+        let mut trust = Trust::default();
+        let id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+        trust.set(
+            id,
+            Perms {
+                pull: true,
+                push: true,
+            },
+        );
+
+        trust.drop_perms(id, &[Access::Pull]);
+
+        let perms = trust.perms(id);
+        assert_eq!(
+            perms,
+            Some(Perms {
+                pull: false,
+                push: true
+            })
+        );
+    }
+
+    #[test]
+    fn dropping_all_perms_should_remove_peer() {
+        let mut trust = Trust::default();
+        let id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+        trust.set(
+            id,
+            Perms {
+                pull: true,
+                push: true,
+            },
+        );
+
+        trust.drop_perms(id, &[Access::Pull, Access::Push]);
+
+        assert!(trust.grants().is_empty());
+    }
+
+    #[test]
+    fn dropping_non_existing_peer_should_return_none() {
+        let mut trust = Trust::default();
+        let id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+
+        let remaining = trust.drop_perms(id, &[Access::Pull]);
+
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn set_keeps_existing_label_when_regranting() {
+        let mut trust = Trust::default();
+        let id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+
+        trust.peers.insert(
+            id,
+            GrantData {
+                perms: Perms {
+                    pull: true,
+                    push: false,
+                },
+                label: Some("test".to_string()),
+            },
+        );
+
+        trust.set(
+            id,
+            Perms {
+                pull: false,
+                push: true,
+            },
+        );
+
+        let grant = trust.peers.get(&id).unwrap();
+        assert_eq!(grant.label, Some("test".to_string()));
+    }
+
+    #[test]
+    fn grants_are_ordered_by_id() {
+        let mut trust = Trust::default();
+        let id1 = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+        let id2 = EndpointId::from_bytes(&[1u8; 32]).unwrap();
+        let id3 = EndpointId::from_bytes(&[0xFFu8; 32]).unwrap();
+
+        trust.set(
+            id2,
+            Perms {
+                pull: true,
+                push: false,
+            },
+        );
+        trust.set(
+            id3,
+            Perms {
+                pull: true,
+                push: false,
+            },
+        );
+        trust.set(
+            id1,
+            Perms {
+                pull: false,
+                push: true,
+            },
+        );
+
+        let grants = trust.grants();
+        assert_eq!(grants[0].id, id1);
+        assert_eq!(grants[1].id, id2);
+        assert_eq!(grants[2].id, id3);
+    }
+
+    #[test]
+    fn round_trip_save_load_should_preserve_trust_set() {
+        let ws = MemWorkspace::new();
+        let mut trust = Trust::default();
+        let id1 = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+        let id2 = EndpointId::from_bytes(&[1u8; 32]).unwrap();
+
+        trust.set(
+            id1,
+            Perms {
+                pull: true,
+                push: false,
+            },
+        );
+        trust.set(
+            id2,
+            Perms {
+                pull: false,
+                push: true,
+            },
+        );
+
+        trust.save(&ws).unwrap();
+
+        let loaded_trust = Trust::load(&ws).unwrap();
+
+        assert_eq!(trust.grants().len(), loaded_trust.grants().len());
+        for grant in trust.grants() {
+            let loaded_perms = loaded_trust.perms(grant.id);
+            assert_eq!(loaded_perms, Some(grant.perms));
+        }
     }
 }
