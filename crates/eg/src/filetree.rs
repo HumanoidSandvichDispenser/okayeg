@@ -72,3 +72,140 @@ pub fn cat_stdio(eg_dir: &Path, paths: &[String]) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_with_files() -> Doc {
+        let doc = Doc::new();
+
+        doc.fs().create_dir("src").unwrap();
+        doc.fs().create_file("src/main.typ").unwrap();
+        doc.fs().create_file("src/file2.typ").unwrap();
+        doc.fs()
+            .text("src/main.typ")
+            .unwrap()
+            .insert(0, "hello")
+            .unwrap();
+        doc.fs()
+            .text("src/file2.typ")
+            .unwrap()
+            .insert(0, "world")
+            .unwrap();
+
+        doc
+    }
+
+    #[test]
+    fn ls_lists_root_directory() {
+        let doc = doc_with_files();
+        let listing = ls(&doc, "").unwrap();
+
+        assert!(matches!(listing, Listing::Dir(_)));
+        let Listing::Dir(entries) = listing else {
+            panic!("expected directory listing");
+        };
+
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "src");
+    }
+
+    #[test]
+    fn ls_lists_directory() {
+        let doc = doc_with_files();
+        let listing = ls(&doc, "src").unwrap();
+
+        assert!(matches!(listing, Listing::Dir(_)));
+        let Listing::Dir(entries) = listing else {
+            panic!("expected directory listing");
+        };
+
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"main.typ"));
+        assert!(names.contains(&"file2.typ"));
+    }
+
+    #[test]
+    fn ls_returns_leaf_for_file() {
+        let doc = doc_with_files();
+        let listing = ls(&doc, "src/main.typ").unwrap();
+
+        assert!(matches!(listing, Listing::Leaf));
+    }
+
+    #[test]
+    fn ls_on_missing_path_returns_error() {
+        let doc = doc_with_files();
+        let result = ls(&doc, "missing");
+
+        assert!(matches!(result, Err(FsError::NotFound)));
+    }
+
+    #[test]
+    fn ls_returns_error_for_file_as_directory() {
+        let doc = doc_with_files();
+        let result = ls(&doc, "src/main.typ/extra");
+
+        assert!(matches!(result, Err(FsError::NotADirectory)));
+    }
+
+    #[test]
+    fn cat_returns_contents_for_existing_files() {
+        let doc = doc_with_files();
+        let paths = vec!["src/main.typ".to_owned()];
+        let results = cat(&doc, &paths);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap(), "hello");
+    }
+
+    #[test]
+    fn cat_returns_contents_for_multiple_existing_files() {
+        let doc = doc_with_files();
+        let paths = vec!["src/main.typ".to_owned(), "src/file2.typ".to_owned()];
+        let results = cat(&doc, &paths);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap(), "hello");
+        assert_eq!(results[1].as_ref().unwrap(), "world");
+    }
+
+    #[test]
+    fn cat_returns_error_for_missing_files() {
+        let doc = doc_with_files();
+        let paths = vec!["missing.typ".to_owned()];
+        let results = cat(&doc, &paths);
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(FsError::NotFound)));
+    }
+
+    #[test]
+    fn cat_returns_error_for_directories() {
+        let doc = doc_with_files();
+        let paths = vec!["src".to_owned()];
+        let results = cat(&doc, &paths);
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(FsError::NotAFile)));
+    }
+
+    #[test]
+    fn cat_returns_mixed_results_for_existing_and_missing_files() {
+        let doc = doc_with_files();
+        let paths = vec![
+            "src/main.typ".to_owned(),
+            "missing.typ".to_owned(),
+            "src/file2.typ".to_owned(),
+        ];
+        let results = cat(&doc, &paths);
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), "hello");
+        assert!(matches!(results[1], Err(FsError::NotFound)));
+        assert_eq!(results[2].as_ref().unwrap(), "world");
+    }
+}
