@@ -178,18 +178,14 @@ impl Comments<'_> {
     /// All comments, or with `file` given only those anchored to that file
     /// (which leaves out replies; follow `parent` links to gather threads).
     pub fn list(&self, file: Option<TreeID>) -> Vec<Comment> {
-        let map = self.map();
-        let mut comments = Vec::new();
-        for id in map.keys() {
-            let Some(comment) = self.comment(&id) else {
-                continue;
-            };
-            let comment = self.read(&id, &comment);
-            if file.is_none() || comment.file == file {
-                comments.push(comment);
-            }
-        }
-        comments
+        self.map()
+            .keys()
+            .filter_map(move |id| {
+                let comment = self.comment(&id)?;
+                Some(self.read(&id, &comment))
+            })
+            .filter(|comment| file.is_none() || comment.file == file)
+            .collect()
     }
 
     fn read(&self, id: &str, comment: &LoroMap) -> Comment {
