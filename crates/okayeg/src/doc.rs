@@ -1,5 +1,8 @@
+use std::ops::ControlFlow;
+
 use loro::{
-    ExportMode, Frontiers, ImportStatus, LoroDoc, LoroError, LoroText, PeerID, VersionVector,
+    ChangeMeta, ExportMode, Frontiers, ImportStatus, LoroDoc, LoroError, LoroText, PeerID,
+    VersionVector,
 };
 
 /// A single Okayeg doc, wrapping one Loro document.
@@ -51,6 +54,23 @@ impl Doc {
     /// The doc's current frontiers, the tips of its history.
     pub fn frontiers(&self) -> Frontiers {
         self.inner.state_frontiers()
+    }
+
+    /// Every change in this doc's history, each listed before its ancestors.
+    pub fn changes(&self) -> impl Iterator<Item = ChangeMeta> {
+        // TODO: make this lazy
+        let mut changes: Vec<ChangeMeta> = Vec::new();
+        let frontiers = self.inner.oplog_frontiers().to_vec();
+
+        self.inner
+            .travel_change_ancestors(&frontiers, &mut |change_meta| {
+                changes.push(change_meta);
+
+                ControlFlow::Continue(())
+            })
+            .expect("travel_change_ancestors should not fail. out of my hands.");
+
+        changes.into_iter()
     }
 
     /// This copy's peer id, the origin marker assigned when the doc is created.
